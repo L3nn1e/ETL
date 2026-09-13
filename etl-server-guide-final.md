@@ -102,6 +102,18 @@ VPN/VLAN-диапазонами.
 
 ## Шаг 3. Quadlet-файлы контейнеров
 
+> **Почему у пяти контейнеров два имени.** Podman резолвит хосты в
+> `etl-network` по фактическому `ContainerName=` (через aardvark-dns), а не по
+> короткому имени из названия Quadlet-файла. Все `ContainerName=` здесь — с
+> префиксом `etl-` (удобно отличать в `podman ps`/`podman exec`/`journalctl`
+> от чужих контейнеров на хосте), а connection-строки в `etl.env` и upstream'ы
+> в `nginx.conf` — без префикса (`postgres`, `rabbitmq`, `elasticsearch`,
+> `airflow-webserver`, `openmetadata-server`). Чтобы короткие имена реально
+> резолвились, у этих пяти контейнеров явно прописан `NetworkAlias=` — без
+> него хосты вроде `postgres` внутри сети просто не существовали бы.
+> Остальным контейнерам (scheduler/worker/flower/nginx/init/migrate) алиас не
+> нужен — к ним никто не обращается по имени изнутри сети.
+
 ### PostgreSQL (localhost)
 ```bash
 cat > /etc/containers/systemd/postgres.container <<'EOF'
@@ -113,6 +125,7 @@ Wants=network-online.target
 [Container]
 Image=docker.io/postgres:16
 ContainerName=etl-postgres
+NetworkAlias=postgres
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/volumes/postgres:/var/lib/postgresql/data:Z
 Volume=/var/storage/containers/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
@@ -152,6 +165,7 @@ Wants=network-online.target
 [Container]
 Image=docker.io/rabbitmq:3.13-management
 ContainerName=etl-rabbitmq
+NetworkAlias=rabbitmq
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/volumes/rabbitmq:/var/lib/rabbitmq:Z
 Volume=/var/storage/containers/rabbitmq/rabbitmq.conf:/etc/rabbitmq/rabbitmq.conf:ro,z
@@ -196,6 +210,7 @@ Wants=network-online.target
 [Container]
 Image=docker.elastic.co/elasticsearch/elasticsearch:8.10.2
 ContainerName=etl-elasticsearch
+NetworkAlias=elasticsearch
 Environment=discovery.type=single-node
 Environment=xpack.security.enabled=false
 Environment=ES_JAVA_OPTS=-Xms4g -Xmx4g
@@ -292,6 +307,7 @@ Requires=postgres.service rabbitmq.service airflow-init.service
 [Container]
 Image=docker.getcollate.io/openmetadata/ingestion:1.5.2
 ContainerName=etl-airflow-webserver
+NetworkAlias=airflow-webserver
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
@@ -481,6 +497,7 @@ Requires=openmetadata-migrate.service
 [Container]
 Image=docker.getcollate.io/openmetadata/server:1.5.2
 ContainerName=etl-om-server
+NetworkAlias=openmetadata-server
 EnvironmentFile=/var/storage/containers/etl.env
 Environment=OPENMETADATA_HEAP_OPTS=-Xms1g -Xmx1g
 PublishPort=127.0.0.1:8585:8585

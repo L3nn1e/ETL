@@ -19,7 +19,63 @@ OpenMetadata по путям `/airflow/` и `/openmetadata/`. Подсеть
 
 ---
 
+## Архитектура
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    ВНЕШНИЕ СИСТЕМЫ                            │
+│  (MSSQL, PostgreSQL, SFTP, REST API, dbt, файлы)              │
+└──────────────┬─────────────────────────┬──────────────────────┘
+               │                         │
+               │ Провайдеры Airflow      │ Коннекторы OpenMetadata
+               │ (движение данных, ETL)  │ (чтение метаданных)
+               ▼                         ▼
+        ┌────────────────────────────────────────┐
+        │     Airflow DAGs — единый кластер        │
+        │  ETL-процессы  +  ingestion-пайплайны    │
+        └────────────────────┬─────────────────────┘
+                              │ Задачи через RabbitMQ
+                              ▼
+                  ┌─────────────────────────┐
+                  │      Airflow Workers      │
+                  │    (выполнение задач)     │
+                  └─────┬───────────────┬─────┘
+       Результаты ETL   │               │  Метаданные из ingestion-DAG'ов
+       (целевые         │               │  (HTTP API → OpenMetadata Server)
+        системы/DWH)    ▼               ▼
+                                  ┌──────────────────────────┐
+                                  │   OpenMetadata Server      │
+                                  │  (хранение метаданных)     │
+                                  └────────────┬────────────────┘
+                                               │ PostgreSQL + ElasticSearch
+                                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    ХРАНИЛИЩЕ ДАННЫХ                            │
+│  PostgreSQL (airflow + openmetadata_db)                        │
+│  ElasticSearch (индексы метаданных)                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+Ключевое отличие от «наивной» схемы с двумя параллельными путями: у `OpenMetadata
+Ingestion` нет собственного независимого маршрута исполнения — это обычные DAG'и,
+которые выполняются **на тех же самых** Airflow Workers через тот же RabbitMQ, что
+и ETL-DAG'и компании. Отдельного встроенного Airflow под ingestion нет (см. раздел
+«OpenMetadata Server» и примечание под ним).
+
+HTTP API между Airflow и OpenMetadata Server работает в обе стороны, и на схеме
+показано только направление «передать результат»:
+- **Worker → Server** — задача внутри ingestion-DAG'а отправляет собранные метаданные;
+- **Server → Airflow** (не показано на схеме отдельной стрелкой, т.к. идёт не через
+  Worker, а напрямую к webserver/API) — OpenMetadata **запускает** ingestion-DAG'и
+  через Airflow REST API. Это и есть Pipeline Service «Airflow», настроенный через
+  `AIRFLOW_HOST`/`PIPELINE_SERVICE_CLIENT_ENABLED` в `etl.env` (Шаг 6).
+
+---
+
 ## Оглавление
+
+**Архитектура**
+- Схема потоков данных и метаданных — раздел «Архитектура» выше
 
 **PostgreSQL**
 - Хранилище конфигураций Airflow и OpenMetadata — раздел «PostgreSQL (localhost)»
@@ -478,13 +534,10 @@ WantedBy=multi-user.target
 EOF
 ```
 
-> Проверьте точное имя скрипта под 1.5.2 перед первым запуском:
-> `podman run --rm --entrypoint ls docker.getcollate.io/openmetadata/server:1.5.2 bootstrap/`
-> (в части версий это `bootstrap_storage.sh migrate`).
->
-> Аналогично сверьте имя переменной для JVM heap в вашей версии образа —
-> `OPENMETADATA_HEAP_OPTS` актуально для 1.5.x, но могло меняться между релизами:
-> `podman run --rm --entrypoint cat docker.getcollate.io/openmetadata/server:1.5.2 bin/openmetadata-server-start.sh | grep -i heap`.
+> Проверено на реальном образе `docker.getcollate.io/openmetadata/server:1.5.2`:
+> скрипт — `openmetadata-ops.sh`, подкоманда — `migrate`, переменная JVM heap —
+> `OPENMETADATA_HEAP_OPTS`. Всё совпадает с тем, что уже прописано здесь и в
+> контейнере ниже — дополнительной проверки перед деплоем не требуется.
 
 ### OpenMetadata Server (за nginx, localhost)
 ```bash

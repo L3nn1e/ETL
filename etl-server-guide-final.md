@@ -23,36 +23,36 @@ OpenMetadata по путям `/airflow/` и `/openmetadata/`. Подсеть
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    ВНЕШНИЕ СИСТЕМЫ                          │
-│  (MSSQL, PostgreSQL, SFTP, REST API, dbt, файлы)            │
-└──────────────┬─────────────────────────┬────────────────────┘
+│                    ВНЕШНИЕ СИСТЕМЫ                            │
+│  (MSSQL, PostgreSQL, SFTP, REST API, dbt, файлы)              │
+└──────────────┬─────────────────────────┬──────────────────────┘
                │                         │
                │ Провайдеры Airflow      │ Коннекторы OpenMetadata
                │ (движение данных, ETL)  │ (чтение метаданных)
                ▼                         ▼
         ┌────────────────────────────────────────┐
-        │     Airflow DAGs — единый кластер      │
-        │  ETL-процессы  +  ingestion-пайплайны  │
-        └────────────────────┬───────────────────┘
-                             │ Задачи через RabbitMQ
-                             ▼
+        │     Airflow DAGs — единый кластер        │
+        │  ETL-процессы  +  ingestion-пайплайны    │
+        └────────────────────┬─────────────────────┘
+                              │ Задачи через RabbitMQ
+                              ▼
                   ┌─────────────────────────┐
-                  │      Airflow Workers    │
-                  │    (выполнение задач)   │
-                  └─────┬───────────────┬───┘
+                  │      Airflow Workers      │
+                  │    (выполнение задач)     │
+                  └─────┬───────────────┬─────┘
        Результаты ETL   │               │  Метаданные из ingestion-DAG'ов
        (целевые         │               │  (HTTP API → OpenMetadata Server)
         системы/DWH)    ▼               ▼
                                   ┌──────────────────────────┐
-                                  │   OpenMetadata Server    │
-                                  │  (хранение метаданных)   │
-                                  └────────────┬─────────────┘
+                                  │   OpenMetadata Server      │
+                                  │  (хранение метаданных)     │
+                                  └────────────┬────────────────┘
                                                │ PostgreSQL + ElasticSearch
                                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    ХРАНИЛИЩЕ ДАННЫХ                         │
-│  PostgreSQL (airflow + openmetadata_db)                     │
-│  ElasticSearch (индексы метаданных)                         │
+│                    ХРАНИЛИЩЕ ДАННЫХ                            │
+│  PostgreSQL (airflow + openmetadata_db)                        │
+│  ElasticSearch (индексы метаданных)                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -98,7 +98,7 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 - Шаг 1 — структура каталогов и права
 - Шаг 2 — сеть etl-network
 - Шаг 4 — конфигурация Nginx (разделение Airflow/OpenMetadata по URL)
-- Шаг 5 — бэкапы Postgres
+- Шаг 5 — бэкапы (Postgres, ElasticSearch, RabbitMQ, конфигурация)
 - Шаг 6 — скрипт развёртывания deploy.sh
 - Шаг 7 — запуск и проверка
 - Итоговая структура файлов
@@ -270,7 +270,9 @@ NetworkAlias=elasticsearch
 Environment=discovery.type=single-node
 Environment=xpack.security.enabled=false
 Environment=ES_JAVA_OPTS=-Xms4g -Xmx4g
+Environment=path.repo=/usr/share/elasticsearch/snapshots
 Volume=/var/storage/volumes/elasticsearch:/usr/share/elasticsearch/data:Z
+Volume=/var/storage/backups/es-snapshots:/usr/share/elasticsearch/snapshots:Z
 PublishPort=127.0.0.1:9200:9200
 Network=etl.network
 HealthCmd=curl -sf http://localhost:9200/_cluster/health
@@ -667,37 +669,135 @@ EOF
 
 ---
 
-## Шаг 5. Бэкапы Postgres — systemd-таймер вместо cron
+## Шаг 5. Бэкапы (Postgres + ElasticSearch + RabbitMQ + конфигурация) — systemd-таймер вместо cron
 
-Скрипт бэкапа:
+Бэкапится всё, из чего реально нельзя тривиально пересобрать состояние:
+
+- **Postgres** — `pg_dumpall` (метабаза Airflow + каталог OpenMetadata);
+- **ElasticSearch** — снапшот через штатный Snapshot API (индекс метаданных технически
+  пересобираем из Postgres переиндексацией, но снапшот на порядок быстрее полного
+  восстановления и не требует ручных действий в UI);
+- **RabbitMQ** — экспорт *определений* (пользователи, vhost'ы, очереди, exchange'и,
+  политики) через Management API. Сами сообщения в очередях не бэкапятся осознанно —
+  это транзитная очередь задач Celery, а не хранилище данных: после восстановления
+  Airflow сам пересоздаст нужные задачи по расписанию DAG'ов;
+- **Конфигурация** — все Quadlet-юниты, `etl.env`/`secrets.env`, `nginx.conf`,
+  `deploy.sh` и сопутствующие скрипты одним архивом. Без этого при потере хоста
+  придётся вручную восстанавливать весь этот гайд по памяти.
+
+### Каталог снапшотов ElasticSearch
+
+ES пишет снапшоты только в каталог, явно объявленный через `path.repo` — этот `Volume=`
+и `Environment=path.repo=...` уже добавлены в `elasticsearch.container` (Шаг 3).
+Здесь достаточно один раз создать сам каталог на хосте с нужными правами до первого
+запуска ES (если контейнер уже был запущен без этих строк — после правки
+потребуется `systemctl restart elasticsearch`):
 
 ```bash
-cat > /var/storage/containers/pg-backup.sh <<'EOF'
+mkdir -p /var/storage/backups/es-snapshots
+chown -R 1000:1000 /var/storage/backups/es-snapshots
+```
+
+### Скрипт бэкапа
+
+```bash
+cat > /var/storage/containers/etl-backup.sh <<'EOF'
 #!/bin/bash
 set -e
 BACKUP_DIR=/var/storage/backups
-mkdir -p "$BACKUP_DIR"
+SECRETS=/var/storage/containers/secrets.env
 TIMESTAMP=$(date +%F)
+MIN_FREE_GB=10
+
+source "$SECRETS"
+mkdir -p "$BACKUP_DIR"
+
+# ── 0. Проверка места ДО запуска — лучше явно упасть в лог, чем оставить
+#      наполовину записанный дамп или забить диск под ноль ──────────────
+free_gb=$(df --output=avail -BG "$BACKUP_DIR" | tail -1 | tr -dc '0-9')
+if [ "$free_gb" -lt "$MIN_FREE_GB" ]; then
+    echo "ОШИБКА: свободно всего ${free_gb}G на $BACKUP_DIR, порог — ${MIN_FREE_GB}G. Бэкап пропущен." >&2
+    exit 1
+fi
+
+# ── 1. Postgres ──────────────────────────────────────────
 podman exec etl-postgres pg_dumpall -U airflow | gzip > "$BACKUP_DIR/pg-${TIMESTAMP}.sql.gz"
 
-# Ротация: хранить 14 дней
-find "$BACKUP_DIR" -name 'pg-*.sql.gz' -mtime +14 -delete
+# ── 2. ElasticSearch — снапшот через Snapshot API ──────────
+REPO_NAME=etl_backup_repo
+SNAPSHOT_NAME="snapshot-${TIMESTAMP}"
+
+# Регистрация репозитория идемпотентна — если уже есть, PUT просто перезапишет тем же
+curl -sf -X PUT "http://localhost:9200/_snapshot/${REPO_NAME}" \
+    -H 'Content-Type: application/json' \
+    -d '{"type":"fs","settings":{"location":"/usr/share/elasticsearch/snapshots"}}' \
+    > /dev/null
+
+curl -sf -X PUT "http://localhost:9200/_snapshot/${REPO_NAME}/${SNAPSHOT_NAME}?wait_for_completion=true" \
+    > /dev/null
+
+# Ротация снапшотов старше 14 дней (сам каталог снапшотов ES не чистит)
+CUTOFF=$(date -d '-14 days' +%F 2>/dev/null || date -v-14d +%F)
+for snap in $(curl -sf "http://localhost:9200/_snapshot/${REPO_NAME}/_all" | grep -oE '"snapshot-[0-9-]+"' | tr -d '"'); do
+    snap_date=${snap#snapshot-}
+    if [[ "$snap_date" < "$CUTOFF" ]]; then
+        curl -sf -X DELETE "http://localhost:9200/_snapshot/${REPO_NAME}/${snap}" > /dev/null
+    fi
+done
+
+# ── 3. RabbitMQ — определения (без содержимого очередей) ───
+curl -sf -u "airflow:${RABBITMQ_PASS}" http://localhost:15672/api/definitions \
+    | gzip > "$BACKUP_DIR/rabbitmq-defs-${TIMESTAMP}.json.gz"
+
+# ── 4. Конфигурация ─────────────────────────────────────
+tar czf "$BACKUP_DIR/config-${TIMESTAMP}.tar.gz" \
+    --warning=no-file-changed \
+    /var/storage/containers/etl.env \
+    /var/storage/containers/secrets.env \
+    /var/storage/containers/init-db.sql \
+    /var/storage/containers/nginx/nginx.conf \
+    /var/storage/containers/deploy.sh \
+    /var/storage/containers/etl-backup.sh \
+    /etc/containers/systemd/*.container \
+    /etc/containers/systemd/*.network \
+    /etc/systemd/system/etl-backup.service \
+    /etc/systemd/system/etl-backup.timer \
+    2>/dev/null || true
+chmod 600 "$BACKUP_DIR/config-${TIMESTAMP}.tar.gz"
+
+# ── 5. Ротация файловых бэкапов (Postgres/RabbitMQ/конфиг) старше 14 дней ──
+find "$BACKUP_DIR" -maxdepth 1 -name 'pg-*.sql.gz' -mtime +14 -delete
+find "$BACKUP_DIR" -maxdepth 1 -name 'rabbitmq-defs-*.json.gz' -mtime +14 -delete
+find "$BACKUP_DIR" -maxdepth 1 -name 'config-*.tar.gz' -mtime +14 -delete
 EOF
-chmod +x /var/storage/containers/pg-backup.sh
+chmod +x /var/storage/containers/etl-backup.sh
 ```
+
+> `tar` в шаге 4 намеренно с `|| true` — если какой-то из файлов конфигурации
+> отсутствует (например, ещё не создан на момент первого прогона), архивация
+> остальных не должна валить весь бэкап через `set -e`.
+>
+> Порог `MIN_FREE_GB=10` — отправная точка, не расчётная величина. При диске
+> 512 ГБ, поделённом между `/var/storage/volumes` (данные БД/ES/RabbitMQ),
+> `/var/storage/containers` (DAG'и, логи Airflow) и `/var/storage/backups`,
+> разумный стартовый бюджет под сами бэкапы — 30-50 ГБ (Postgres — основная
+> статья, ES-снапшоты и RabbitMQ-определения обычно на порядок меньше, конфиг —
+> считанные килобайты). Порог проверки стоит держать заметно ниже этого бюджета
+> (не впритык), чтобы получить сигнал заранее, а не в момент, когда бэкапы уже
+> перестали влезать.
 
 Сервис (обычный systemd-юнит, не Quadlet — это не контейнер, а запуск скрипта на хосте):
 
 ```bash
-cat > /etc/systemd/system/pg-backup.service <<'EOF'
+cat > /etc/systemd/system/etl-backup.service <<'EOF'
 [Unit]
-Description=Backup PostgreSQL databases for ETL stack
-After=postgres.service
-Requires=postgres.service
+Description=Backup Postgres/ElasticSearch/RabbitMQ/config for ETL stack
+After=postgres.service elasticsearch.service rabbitmq.service
+Requires=postgres.service elasticsearch.service rabbitmq.service
 
 [Service]
 Type=oneshot
-ExecStart=/var/storage/containers/pg-backup.sh
+ExecStart=/var/storage/containers/etl-backup.sh
 EOF
 ```
 
@@ -706,9 +806,9 @@ EOF
 выполнится сразу после следующего старта):
 
 ```bash
-cat > /etc/systemd/system/pg-backup.timer <<'EOF'
+cat > /etc/systemd/system/etl-backup.timer <<'EOF'
 [Unit]
-Description=Daily PostgreSQL backup timer
+Description=Daily ETL stack backup timer
 
 [Timer]
 OnCalendar=*-*-* 03:00:00
@@ -722,10 +822,12 @@ EOF
 
 Проверка после включения (Шаг 7):
 ```bash
-systemctl list-timers pg-backup.timer
+systemctl list-timers etl-backup.timer
 # Разовый прогон вручную, не дожидаясь 03:00:
-systemctl start pg-backup.service
+systemctl start etl-backup.service
 ls -la /var/storage/backups/
+# Ожидается: pg-<дата>.sql.gz, rabbitmq-defs-<дата>.json.gz, config-<дата>.tar.gz
+curl -s http://localhost:9200/_snapshot/etl_backup_repo/_all | grep -o '"snapshot":"[^"]*"'
 ```
 
 ---
@@ -968,7 +1070,7 @@ systemctl enable postgres rabbitmq elasticsearch \
     openmetadata-migrate openmetadata-server nginx
 
 echo "[7/8] Включение таймера бэкапов..."
-systemctl enable --now pg-backup.timer
+systemctl enable --now etl-backup.timer
 
 echo ""
 echo "============================================"
@@ -988,7 +1090,8 @@ echo "   ElasticSearch: ssh -L 9200:127.0.0.1:9200 root@${IP}"
 echo "   Flower:        ssh -L 5555:127.0.0.1:5555 root@${IP}"
 echo "   OpenMetadata (прямой порт, минуя nginx): ssh -L 8585:127.0.0.1:8585 root@${IP}"
 echo ""
-echo " Бэкапы Postgres: /var/storage/backups (ежедневно 03:00, таймер pg-backup.timer)"
+echo " Бэкапы: /var/storage/backups (ежедневно 03:00, таймер etl-backup.timer:"
+echo "   Postgres + ElasticSearch-снапшоты + RabbitMQ-определения + конфигурация)"
 echo " Секреты: $SECRETS"
 echo "============================================"
 DEPLOY
@@ -1024,7 +1127,7 @@ curl -sI http://localhost/openmetadata/ | head -1
 podman ps --format "table {{.Names}}\t{{.Status}}"
 
 # Таймер бэкапов
-systemctl list-timers pg-backup.timer
+systemctl list-timers etl-backup.timer
 
 # Провайдеры реально установились (не молча пропущены)
 podman exec etl-airflow-worker airflow providers list
@@ -1038,7 +1141,7 @@ podman exec etl-airflow-worker airflow providers list
 /var/storage/
 ├── containers/
 │   ├── deploy.sh
-│   ├── pg-backup.sh
+│   ├── etl-backup.sh
 │   ├── secrets.env              ← chmod 600
 │   ├── etl.env                  ← chmod 600
 │   ├── init-db.sql              ← chmod 600
@@ -1056,7 +1159,11 @@ podman exec etl-airflow-worker airflow providers list
 │   ├── postgres/
 │   ├── elasticsearch/
 │   └── rabbitmq/
-└── backups/                      ← дампы pg_dumpall
+└── backups/
+    ├── es-snapshots/              ← репозиторий снапшотов ElasticSearch
+    ├── pg-<дата>.sql.gz
+    ├── rabbitmq-defs-<дата>.json.gz
+    └── config-<дата>.tar.gz       ← chmod 600 (содержит secrets.env)
 
 /etc/containers/systemd/
 ├── etl.network
@@ -1073,8 +1180,8 @@ podman exec etl-airflow-worker airflow providers list
 └── openmetadata-server.container
 
 /etc/systemd/system/
-├── pg-backup.service
-└── pg-backup.timer
+├── etl-backup.service
+└── etl-backup.timer
 ```
 
 ---
@@ -1090,10 +1197,10 @@ systemctl status postgres rabbitmq elasticsearch \
 # Логи
 journalctl -u airflow-scheduler -f
 journalctl -u openmetadata-server -f
-journalctl -u pg-backup.service
+journalctl -u etl-backup.service
 
-# Ручной прогон бэкапа
-systemctl start pg-backup.service
+# Ручной прогон бэкапа (Postgres + ES-снапшот + RabbitMQ-определения + конфиг)
+systemctl start etl-backup.service
 
 # Перезапуск
 systemctl restart airflow-worker

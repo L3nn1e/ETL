@@ -7,8 +7,9 @@ MSSQL/SFTP/Samba/SSH/JDBC/ODBC/dbt/HTTP), и ingestion-пайплайны OpenMe
 зарегистрированные как Pipeline Service «Airflow» — отдельного встроенного Airflow
 внутри OpenMetadata не разворачивается. Внутренние сервисы (Postgres, RabbitMQ,
 ElasticSearch, Airflow Flower, Airflow webserver, OpenMetadata Server) слушают только
-`127.0.0.1`; наружу смотрит только один порт — 80, nginx разводит Airflow UI и
-OpenMetadata по путям `/airflow/` и `/openmetadata/`. Подсеть
+`127.0.0.1`; наружу смотрит только один порт — 80, nginx разводит Airflow UI,
+OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/` (последний —
+за отдельным логином, поверх общей точки входа). Подсеть
 `etl-network` подбирается автоматически под хост, секреты генерируются чистым bash без
 внешних зависимостей, бэкапы Postgres идут по systemd-таймеру, лимиты контейнеров
 рассчитаны под сервер 32 ГБ RAM / 4-8 vCPU.
@@ -30,10 +31,10 @@ OpenMetadata по путям `/airflow/` и `/openmetadata/`. Подсеть
                │ Провайдеры Airflow      │ Коннекторы OpenMetadata
                │ (движение данных, ETL)  │ (чтение метаданных)
                ▼                         ▼
-        ┌──────────────────────────────────────────┐
-        │     Airflow DAGs — единый кластер        │
-        │  ETL-процессы  +  ingestion-пайплайны    │
-        └─────────────────────┬────────────────────┘
+        ┌───────────────────────────────────────────┐
+        │     Airflow DAGs — единый кластер         │
+        │  ETL-процессы  +  ingestion-пайплайны     │
+        └─────────────────────┬─────────────────────┘
                               │ Задачи через RabbitMQ
                               ▼
                   ┌───────────────────────────┐
@@ -83,7 +84,7 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 **Apache Airflow**
 - Message broker: RabbitMQ — раздел «RabbitMQ (localhost)»
 - WebServer: Nginx — раздел «Nginx (внешний доступ)» (конфиг — Шаг 4)
-- Executor: Celery Executor — разделы «Airflow Worker», «Airflow Flower (localhost)» (мониторинг очереди)
+- Executor: Celery Executor — разделы «Airflow Worker», «Airflow Flower (за nginx, localhost)» (мониторинг очереди, свой логин через Basic Auth)
 - Server: Airflow — разделы «Airflow Init (Oneshot)», «Airflow Webserver», «Airflow Scheduler»
 - Провайдеры данных (dbt-cloud, http, jdbc, odbc, mssql, postgres, samba, sftp, ssh) — заданы в `etl.env` внутри Шага 6
 
@@ -158,17 +159,17 @@ VPN/VLAN-диапазонами.
 
 ## Шаг 3. Quadlet-файлы контейнеров
 
-> **Почему у пяти контейнеров два имени.** Podman резолвит хосты в
+> **Почему у шести контейнеров два имени.** Podman резолвит хосты в
 > `etl-network` по фактическому `ContainerName=` (через aardvark-dns), а не по
 > короткому имени из названия Quadlet-файла. Все `ContainerName=` здесь — с
 > префиксом `etl-` (удобно отличать в `podman ps`/`podman exec`/`journalctl`
 > от чужих контейнеров на хосте), а connection-строки в `etl.env` и upstream'ы
 > в `nginx.conf` — без префикса (`postgres`, `rabbitmq`, `elasticsearch`,
-> `airflow-webserver`, `openmetadata-server`). Чтобы короткие имена реально
-> резолвились, у этих пяти контейнеров явно прописан `NetworkAlias=` — без
-> него хосты вроде `postgres` внутри сети просто не существовали бы.
-> Остальным контейнерам (scheduler/worker/flower/nginx/init/migrate) алиас не
-> нужен — к ним никто не обращается по имени изнутри сети.
+> `airflow-webserver`, `airflow-flower`, `openmetadata-server`). Чтобы короткие
+> имена реально резолвились, у этих шести контейнеров явно прописан
+> `NetworkAlias=` — без него хосты вроде `postgres` внутри сети просто не
+> существовали бы. Остальным контейнерам (scheduler/worker/nginx/init/migrate)
+> алиас не нужен — к ним никто не обращается по имени изнутри сети.
 
 ### PostgreSQL (localhost)
 ```bash
@@ -451,7 +452,7 @@ EOF
 > основном I/O-bound (MSSQL/SFTP/Samba/HTTP), поэтому конкурентность заметно выше
 > числа ядер оправдана: воркер большую часть времени ждёт сеть/диск, а не считает.
 
-### Airflow Flower (localhost)
+### Airflow Flower (за nginx, localhost)
 ```bash
 cat > /etc/containers/systemd/airflow-flower.container <<'EOF'
 [Unit]
@@ -462,6 +463,7 @@ Requires=postgres.service rabbitmq.service airflow-init.service
 [Container]
 Image=docker.getcollate.io/openmetadata/ingestion:1.5.2
 ContainerName=etl-airflow-flower
+NetworkAlias=airflow-flower
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
@@ -469,7 +471,10 @@ Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 PublishPort=127.0.0.1:5555:5555
 Network=etl.network
-Command=celery flower
+Command=celery flower --url-prefix=flower --basic-auth=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
+HealthCmd=curl -sf -u ${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS} http://localhost:5555/flower/
+HealthInterval=15s
+HealthRetries=6
 PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
 
 [Service]
@@ -480,13 +485,27 @@ WantedBy=multi-user.target
 EOF
 ```
 
+> **Подстановка `${FLOWER_ADMIN_USER}`/`${FLOWER_ADMIN_PASS}` в `Command=`/`HealthCmd=`
+> работает через systemd, не через shell.** Это не heredoc-интерполяция (тут кавычки
+> `'EOF'` как раз запрещают её) — systemd сам подставляет `$VAR`/`${VAR}` в
+> `ExecStart=` из окружения юнита, а `EnvironmentFile=/var/storage/containers/etl.env`
+> прямо здесь это окружение и формирует. Both переменные должны быть в `etl.env`
+> (Шаг 6) до первого старта контейнера — иначе подставится пустая строка, и
+> `--basic-auth=:` завершится ошибкой при старте Flower.
+>
+> `--url-prefix=flower` и флаги через дефис (`--basic-auth`, не `--basic_auth`) —
+> потому что `celery flower` здесь фактически вызывается как `airflow celery flower`
+> (через entrypoint образа, так же как `Command=scheduler` реально означает
+> `airflow scheduler`), а не как отдельный пакет `flower` — у CLI-обёртки Airflow
+> имена флагов другие, чем в документации самого Flower.
+
 ### Nginx (внешний доступ)
 ```bash
 cat > /etc/containers/systemd/nginx.container <<'EOF'
 [Unit]
 Description=Nginx
-After=airflow-webserver.service openmetadata-server.service
-Requires=airflow-webserver.service openmetadata-server.service
+After=airflow-webserver.service openmetadata-server.service airflow-flower.service
+Requires=airflow-webserver.service openmetadata-server.service airflow-flower.service
 
 [Container]
 Image=docker.io/nginx:1.27-alpine
@@ -505,11 +524,11 @@ EOF
 ```
 
 > Единственный контейнер с портом на всех интерфейсах (`80:80` без `127.0.0.1:`) —
-> это осознанно единственная внешняя точка входа: и к Airflow (`/airflow/`), и к
-> OpenMetadata (`/openmetadata/`), см. Шаг 4. `Requires=` теперь на оба сервиса —
-> раньше OpenMetadata стартовал независимо от nginx (у него был свой прямой порт
-> 8585), теперь он обязателен, иначе `/openmetadata/` будет отдавать 502. TLS/443
-> в этом рецепте не настраивается.
+> это осознанно единственная внешняя точка входа: к Airflow (`/airflow/`),
+> OpenMetadata (`/openmetadata/`) и Flower (`/flower/`), см. Шаг 4. `Requires=`
+> теперь на все три сервиса — раньше OpenMetadata и Flower стартовали независимо от
+> nginx (у обоих были свои прямые порты), теперь они обязательны, иначе
+> соответствующий путь будет отдавать 502. TLS/443 в этом рецепте не настраивается.
 
 ### OpenMetadata Migrate (Oneshot)
 ```bash
@@ -606,9 +625,11 @@ EOF
 
 ## Шаг 4. Конфигурация Nginx — разделение по URL, не по портам
 
-Вместо отдельного порта 8585 для OpenMetadata — единственный порт 80 наружу с
-разными путями: `/airflow/` и `/openmetadata/`. Правило `location = /` — просто
-удобный редирект по умолчанию, необязателен.
+Вместо отдельного порта 8585 для OpenMetadata и 5555 для Flower — единственный порт 80
+наружу с разными путями: `/airflow/`, `/openmetadata/`, `/flower/`. Правило `location = /`
+— просто удобный редирект по умолчанию, необязателен. Flower защищён собственной
+Basic Auth (Шаг 3) независимо от nginx — это по-прежнему актуально, даже когда доступ
+идёт через один общий порт с остальными сервисами.
 
 ```bash
 cat > /var/storage/containers/nginx/nginx.conf <<'EOF'
@@ -620,6 +641,9 @@ http {
     }
     upstream openmetadata {
         server openmetadata-server:8585;
+    }
+    upstream flower {
+        server airflow-flower:5555;
     }
 
     server {
@@ -650,22 +674,38 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
         }
+
+        location /flower/ {
+            proxy_pass http://flower;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+        }
     }
 }
 EOF
 ```
 
-Два `location` устроены по-разному — это не опечатка:
+Три `location` устроены по-разному — это не опечатка:
 
 - **`/airflow/`** — nginx **обрезает** префикс (`proxy_pass http://airflow/;` с
   завершающим `/`), а `X-Forwarded-Prefix` сообщает Airflow, что было обрезано, —
   чтобы он сам подставлял `/airflow` обратно при генерации ссылок и редиректов
   (это штатный механизм `ENABLE_PROXY_FIX`, см. Шаг 6).
-- **`/openmetadata/`** — nginx **не обрезает** префикс (`proxy_pass http://openmetadata;`
-  без пути), потому что OpenMetadata сам ожидает видеть `/openmetadata/...` целиком —
-  это то, как работает его `BASE_PATH` (см. Шаг 6): приложение регистрирует свои
-  маршруты сразу под этим префиксом, а не «не знает» о нём и ждёт подсказки через
-  заголовок, как Airflow.
+- **`/openmetadata/`** и **`/flower/`** — nginx **не обрезает** префикс
+  (`proxy_pass http://openmetadata;`/`http://flower;` без пути), потому что у обоих
+  свой встроенный механизм, где приложение само ожидает видеть префикс целиком:
+  `BASE_PATH` у OpenMetadata и `--url-prefix=flower` у Flower (Шаг 3/6) регистрируют
+  маршруты сразу под этим путём — в отличие от Airflow, которому нужна подсказка
+  через заголовок, а не сам путь в запросе.
+- `proxy_http_version 1.1`/`Upgrade`/`Connection` у `/flower/` — на случай, если
+  Flower использует WebSocket для live-обновлений дашборда (обновление статусов задач
+  без перезагрузки страницы); без этих строк живое обновление может не работать,
+  сама же страница откроется и без них.
 
 ---
 
@@ -940,6 +980,8 @@ AIRFLOW_ADMIN_USER=etl_admin
 AIRFLOW_ADMIN_PASS=$(pw)
 OM_ADMIN_USER=om_admin
 OM_ADMIN_PASS=$(pw)
+FLOWER_ADMIN_USER=flower_admin
+FLOWER_ADMIN_PASS=$(pw)
 JWT_KEY_ID=$(hex 16)
 EOF
     chmod 600 "$SECRETS"
@@ -996,6 +1038,8 @@ AIRFLOW__WEBSERVER__BASE_URL=http://${IP}/airflow
 AIRFLOW__WEBSERVER__ENABLE_PROXY_FIX=True
 AIRFLOW_ADMIN_USER=${AIRFLOW_ADMIN_USER}
 AIRFLOW_ADMIN_PASS=${AIRFLOW_ADMIN_PASS}
+FLOWER_ADMIN_USER=${FLOWER_ADMIN_USER}
+FLOWER_ADMIN_PASS=${FLOWER_ADMIN_PASS}
 OPENMETADATA_CLUSTER_NAME=openmetadata
 BASE_PATH=/openmetadata
 DB_DRIVER_CLASS=org.postgresql.Driver
@@ -1056,6 +1100,7 @@ systemctl start airflow-init
 
 systemctl start airflow-webserver airflow-scheduler airflow-worker airflow-flower
 wait_healthy etl-airflow-webserver 60
+wait_healthy etl-airflow-flower 60
 
 systemctl start openmetadata-migrate
 systemctl start openmetadata-server
@@ -1083,12 +1128,15 @@ echo ""
 echo " OpenMetadata  http://${IP}/openmetadata"
 echo "   ${OM_ADMIN_USER} / ${OM_ADMIN_PASS}"
 echo ""
-echo " Внутренние сервисы (доступ через SSH-туннель):"
+echo " Flower        http://${IP}/flower"
+echo "   ${FLOWER_ADMIN_USER} / ${FLOWER_ADMIN_PASS}"
+echo ""
+echo " Внутренние сервисы (доступ через SSH-туннель, без своего логина):"
 echo "   Postgres:      ssh -L 5432:127.0.0.1:5432 root@${IP}"
 echo "   RabbitMQ:      ssh -L 15672:127.0.0.1:15672 root@${IP}"
 echo "   ElasticSearch: ssh -L 9200:127.0.0.1:9200 root@${IP}"
-echo "   Flower:        ssh -L 5555:127.0.0.1:5555 root@${IP}"
 echo "   OpenMetadata (прямой порт, минуя nginx): ssh -L 8585:127.0.0.1:8585 root@${IP}"
+echo "   Flower (прямой порт, минуя nginx, логин тот же что и выше): ssh -L 5555:127.0.0.1:5555 root@${IP}"
 echo ""
 echo " Бэкапы: /var/storage/backups (ежедневно 03:00, таймер etl-backup.timer:"
 echo "   Postgres + ElasticSearch-снапшоты + RabbitMQ-определения + конфигурация)"
@@ -1120,8 +1168,13 @@ ss -tlnp | grep -E '5432|5672|9200|5555|8080|8585'
 #            127.0.0.1:8080, 127.0.0.1:8585
 
 # Разделение по URL реально работает
+source /var/storage/containers/secrets.env
 curl -sI http://localhost/airflow/ | head -1
 curl -sI http://localhost/openmetadata/ | head -1
+curl -sI http://localhost/flower/ | head -1
+# Ожидается 401 без логина/пароля — Basic Auth реально требуется:
+curl -sI -u "$FLOWER_ADMIN_USER:$FLOWER_ADMIN_PASS" http://localhost/flower/ | head -1
+# Ожидается 200 с правильными кредами
 
 # Контейнеры
 podman ps --format "table {{.Names}}\t{{.Status}}"

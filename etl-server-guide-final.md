@@ -50,11 +50,11 @@ OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/`
                                   └────────────┬────────────────┘
                                                │ PostgreSQL + ElasticSearch
                                                ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    ХРАНИЛИЩЕ ДАННЫХ                         │
-│  PostgreSQL (airflow + openmetadata_db)                     │
-│  ElasticSearch (индексы метаданных)                         │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                    ХРАНИЛИЩЕ ДАННЫХ                        │
+│  PostgreSQL (airflow + openmetadata_db)                    │
+│  ElasticSearch (индексы метаданных)                        │
+└────────────────────────────────────────────────────────────┘
 ```
 
 Ключевое отличие от «наивной» схемы с двумя параллельными путями: у `OpenMetadata
@@ -67,9 +67,47 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 показано только направление «передать результат»:
 - **Worker → Server** — задача внутри ingestion-DAG'а отправляет собранные метаданные;
 - **Server → Airflow** (не показано на схеме отдельной стрелкой, т.к. идёт не через
-  Worker, а напрямую к webserver/API) — OpenMetadata **запускает** ingestion-DAG'и
+  Worker, а напрямую к api-server) — OpenMetadata **запускает** ingestion-DAG'и
   через Airflow REST API. Это и есть Pipeline Service «Airflow», настроенный через
   `AIRFLOW_HOST`/`PIPELINE_SERVICE_CLIENT_ENABLED` в `etl.env` (Шаг 6).
+
+### Версии компонентов
+
+| Компонент | Версия | Образ | Примечание |
+|---|---|---|---|
+| PostgreSQL | 16 | `docker.io/postgres:16` | БД Airflow + БД OpenMetadata |
+| RabbitMQ | 3.13 (management) | `docker.io/rabbitmq:3.13-management` | брокер Celery |
+| ElasticSearch | 9.3.0 | `docker.elastic.co/elasticsearch/elasticsearch:9.3.0` | минимум 9.0.0, рекомендуется 9.3.0 — см. пояснение ниже |
+| Nginx | 1.27 (alpine) | `docker.io/nginx:1.27-alpine` | реверс-прокси |
+| Apache Airflow | 3.3.1 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | версия жёстко зашита в тег `ingestion` — не выбирается отдельно от версии OpenMetadata |
+| OpenMetadata Server | 1.13.6 | `docker.getcollate.io/openmetadata/server:1.13.6` | |
+| OpenMetadata Ingestion | 1.13.6 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | тот же образ, что и Airflow-кластер — см. «Архитектура» выше |
+
+**Про версию ElasticSearch.** У самой OpenMetadata документация по этому вопросу
+на момент написания гайда противоречит сама себе между страницами: часть страниц
+(`/latest/deployment/bare-metal`, `-SNAPSHOT/production-ready-requirements`) всё ещё
+показывает старое ограничение «до 8.11.4», а другие, более точечно версионированные
+страницы того же семейства (`v1.13.x/deployment/kubernetes/aks`,
+`v2.0.x/deployment/bare-metal`, `v2.0.x/deployment/kubernetes/on-prem`) прямо
+называют **Elasticsearch 9.x (минимум 9.0.0, рекомендуется 9.3.0)** как
+поддерживаемую версию для этой линейки. Так как более свежие/специфичные страницы
+явно называют конкретную рекомендованную версию (9.3.0) — а не просто унаследовали
+старый текст — используем её. Плюс это подтверждено практическим прогоном (открытый
+отчёт о развёртывании OpenMetadata + Elasticsearch 9.3.0: миграция, индексация,
+end-to-end ingestion и поиск отработали без проблем).
+
+Тем не менее это мажорный скачок с 8.x, объективно менее обкатанный в связке с
+OpenMetadata, чем 8.11.4 — после первого деплоя стоит явно прогнать через UI
+OpenMetadata один тестовый ingestion до созданной таблицы и убедиться, что она
+находится через поиск, а не полагаться только на здоровый `HealthCmd` контейнера.
+
+**Почему версия Airflow не выбирается отдельно от OpenMetadata.** В этой архитектуре
+нет отдельно устанавливаемого Airflow — весь Celery-кластер работает на образе
+`openmetadata/ingestion`, а версия Airflow внутри него фиксирована конкретным тегом
+OpenMetadata: 1.13.0 бандлит Airflow 3.2.1, начиная с 1.13.5 (и в 1.13.6) — Airflow
+3.3.1 (подтверждено официальным changelog: «Airflow → 3.3.1», исправление CVE). То
+есть выбор тега `1.13.6` уже даёт нужную версию Airflow — это не два независимых
+решения, а одно.
 
 ---
 
@@ -77,6 +115,7 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 
 **Архитектура**
 - Схема потоков данных и метаданных — раздел «Архитектура» выше
+- Таблица версий всех компонентов и пояснение по выбору ElasticSearch 9.3.0 — раздел «Версии компонентов»
 
 **PostgreSQL**
 - Хранилище конфигураций Airflow и OpenMetadata — раздел «PostgreSQL (localhost)»
@@ -265,7 +304,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=docker.elastic.co/elasticsearch/elasticsearch:8.11.4
+Image=docker.elastic.co/elasticsearch/elasticsearch:9.3.0
 ContainerName=etl-elasticsearch
 NetworkAlias=elasticsearch
 Environment=discovery.type=single-node

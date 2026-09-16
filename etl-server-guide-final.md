@@ -50,11 +50,11 @@ OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/`
                                   └────────────┬────────────────┘
                                                │ PostgreSQL + ElasticSearch
                                                ▼
-┌────────────────────────────────────────────────────────────┐
-│                    ХРАНИЛИЩЕ ДАННЫХ                        │
-│  PostgreSQL (airflow + openmetadata_db)                    │
-│  ElasticSearch (индексы метаданных)                        │
-└────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    ХРАНИЛИЩЕ ДАННЫХ                         │
+│  PostgreSQL (airflow + openmetadata_db)                     │
+│  ElasticSearch (индексы метаданных)                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 Ключевое отличие от «наивной» схемы с двумя параллельными путями: у `OpenMetadata
@@ -75,13 +75,23 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 
 | Компонент | Версия | Образ | Примечание |
 |---|---|---|---|
-| PostgreSQL | 16 | `docker.io/postgres:16` | БД Airflow + БД OpenMetadata |
+| PostgreSQL | 17 | `docker.io/postgres:17` | БД Airflow + БД OpenMetadata — совместимость см. пояснение ниже |
 | RabbitMQ | 3.13 (management) | `docker.io/rabbitmq:3.13-management` | брокер Celery |
 | ElasticSearch | 9.3.0 | `docker.elastic.co/elasticsearch/elasticsearch:9.3.0` | минимум 9.0.0, рекомендуется 9.3.0 — см. пояснение ниже |
 | Nginx | 1.27 (alpine) | `docker.io/nginx:1.27-alpine` | реверс-прокси |
 | Apache Airflow | 3.3.1 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | версия жёстко зашита в тег `ingestion` — не выбирается отдельно от версии OpenMetadata |
 | OpenMetadata Server | 1.13.6 | `docker.getcollate.io/openmetadata/server:1.13.6` | |
 | OpenMetadata Ingestion | 1.13.6 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | тот же образ, что и Airflow-кластер — см. «Архитектура» выше |
+
+**Про версию PostgreSQL.** Официальная документация именно под Airflow 3.3.1 (не
+общий алиас «stable», который со временем указывает на другой релиз) прямо
+перечисляет поддерживаемые версии: **PostgreSQL 13, 14, 15, 16, 17** — 17 в списке
+есть явно. У OpenMetadata верхней границы нет вообще, только нижняя (`12.0 или
+выше` на части страниц, `15 или выше` — на более новых, той же линии документации,
+что уже подтвердила ES 9.x) — то есть 17 не просто поддерживается, а выше нового
+рекомендуемого минимума. Оба клиента БД (`psycopg2` у Airflow, `org.postgresql.Driver`
+у OpenMetadata) работают поверх стабильного wire-протокола Postgres, который не
+меняется между мажорными версиями — рисков на уровне драйверов нет.
 
 **Про версию ElasticSearch.** У самой OpenMetadata документация по этому вопросу
 на момент написания гайда противоречит сама себе между страницами: часть страниц
@@ -219,7 +229,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=docker.io/postgres:16
+Image=docker.io/postgres:17
 ContainerName=etl-postgres
 NetworkAlias=postgres
 EnvironmentFile=/var/storage/containers/etl.env

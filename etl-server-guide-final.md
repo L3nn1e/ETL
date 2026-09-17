@@ -79,7 +79,7 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 | RabbitMQ | 3.13 (management) | `docker.io/rabbitmq:3.13-management` | брокер Celery |
 | ElasticSearch | 9.3.0 | `docker.elastic.co/elasticsearch/elasticsearch:9.3.0` | минимум 9.0.0, рекомендуется 9.3.0 — см. пояснение ниже |
 | Nginx | 1.27 (alpine) | `docker.io/nginx:1.27-alpine` | реверс-прокси |
-| Apache Airflow | 3.3.1 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | версия жёстко зашита в тег `ingestion` — не выбирается отдельно от версии OpenMetadata |
+| Apache Airflow | 3.3.1 | `localhost/etl-airflow:1.13.6` (свой, `FROM openmetadata/ingestion:1.13.6`) | версия жёстко зашита в базовый тег `ingestion` — не выбирается отдельно от версии OpenMetadata; провайдеры зашиты сборкой, см. «Кастомный образ Airflow» в Шаге 3 |
 | OpenMetadata Server | 1.13.6 | `docker.getcollate.io/openmetadata/server:1.13.6` | |
 | OpenMetadata Ingestion | 1.13.6 | `docker.getcollate.io/openmetadata/ingestion:1.13.6` | тот же образ, что и Airflow-кластер — см. «Архитектура» выше |
 
@@ -134,8 +134,8 @@ OpenMetadata: 1.13.0 бандлит Airflow 3.2.1, начиная с 1.13.5 (и 
 - Message broker: RabbitMQ — раздел «RabbitMQ (localhost)»
 - WebServer: Nginx — раздел «Nginx (внешний доступ)» (конфиг — Шаг 4)
 - Executor: Celery Executor — разделы «Airflow Worker», «Airflow Flower (за nginx, localhost)» (мониторинг очереди, свой логин через Basic Auth)
-- Server: Airflow — разделы «Airflow Init (Oneshot)», «Airflow Webserver», «Airflow Scheduler»
-- Провайдеры данных (dbt-cloud, http, jdbc, odbc, mssql, postgres, samba, sftp, ssh) — заданы в `etl.env` внутри Шага 6
+- Server: Airflow — разделы «Airflow Init (Oneshot)», «Airflow API Server», «Airflow Scheduler», «Airflow Dag Processor», «Airflow Triggerer» (два последних — новые обязательные компоненты в Airflow 3.x)
+- Провайдеры данных (dbt-cloud, http, jdbc, odbc, mssql, postgres, samba, sftp, ssh, fab, celery) — зашиты в кастомный образ, раздел «Кастомный образ Airflow» в Шаге 3
 
 **OpenMetadata**
 - Search Engine: ElasticSearch — раздел «ElasticSearch (localhost)»
@@ -147,7 +147,8 @@ OpenMetadata: 1.13.0 бандлит Airflow 3.2.1, начиная с 1.13.5 (и 
 **Инфраструктура и эксплуатация** *(вне исходных требований, но нужно для деплоя)*
 - Шаг 1 — структура каталогов и права
 - Шаг 2 — сеть etl-network
-- Шаг 4 — конфигурация Nginx (разделение Airflow/OpenMetadata по URL)
+- Шаг 3 — сборка кастомного образа Airflow (провайдеры, пиннинг версий через constraints-файл)
+- Шаг 4 — конфигурация Nginx (разделение Airflow/OpenMetadata/Flower по URL)
 - Шаг 5 — бэкапы (Postgres, ElasticSearch, RabbitMQ, конфигурация)
 - Шаг 6 — скрипт развёртывания deploy.sh
 - Шаг 7 — запуск и проверка
@@ -159,7 +160,13 @@ OpenMetadata: 1.13.0 бандлит Airflow 3.2.1, начиная с 1.13.5 (и 
 ## Шаг 1. Подготовка структуры каталогов и прав
 
 ```bash
-dnf install -y podman podman-plugins slirp4netns fuse-overlayfs
+dnf install -y podman slirp4netns fuse-overlayfs
+
+# netavark/aardvark-dns — сетевой стек, на котором держится вся DNS-резолюция
+# по NetworkAlias= в этом гайде (Шаг 3). На AlmaLinux 10 тянутся как зависимости
+# пакета podman автоматически; если по какой-то причине не установились — гайд
+# сломается на первом же NetworkAlias, поэтому лучше свериться сразу:
+rpm -q netavark aardvark-dns || dnf install -y netavark aardvark-dns
 
 # sysctl для ElasticSearch
 cat > /etc/sysctl.d/99-elasticsearch.conf <<'EOF'
@@ -169,7 +176,7 @@ sysctl -p /etc/sysctl.d/99-elasticsearch.conf
 
 # Каталоги
 mkdir -p /var/storage/volumes/{postgres,rabbitmq,elasticsearch}
-mkdir -p /var/storage/containers/{airflow/{dags,logs,plugins,python-deps},nginx}
+mkdir -p /var/storage/containers/{airflow/{dags,logs,plugins},nginx}
 mkdir -p /var/storage/backups
 mkdir -p /etc/containers/systemd
 
@@ -219,6 +226,75 @@ VPN/VLAN-диапазонами.
 > `NetworkAlias=` — без него хосты вроде `postgres` внутри сети просто не
 > существовали бы. Остальным контейнерам (scheduler/worker/nginx/init/migrate)
 > алиас не нужен — к ним никто не обращается по имени изнутри сети.
+
+### Кастомный образ Airflow — провайдеры зашиты в сборку, не ставятся при старте
+
+`_PIP_ADDITIONAL_REQUIREMENTS` (механизм runtime-установки пакетов при каждом
+старте контейнера) сам Airflow прямым текстом называет фичей для
+разработки/тестирования и явно предупреждает не использовать её в проде — сообщение
+выводится при каждом запуске: `NEVER use it in production! Instead, build a custom
+image`. Два практических риска, помимо самого предупреждения: установка идёт заново
+при **каждом** старте контейнера (если в момент рестарта недоступен PyPI —
+Airflow не поднимется вообще, хотя раньше работал без сети), и версии провайдеров
+не зафиксированы — при следующем перезапуске можно внезапно получить более новую
+мажорную версию с breaking changes без единого шага в этом гайде, который бы это
+заметил. Собираем свой образ вместо этого — ровно так, как рекомендует официальная
+документация Airflow.
+
+**Узнать версию Python внутри базового образа** — она нужна, чтобы взять правильный
+constraints-файл (см. ниже):
+```bash
+podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 python3 --version
+```
+Дальше в примерах используется `3.12` — если у вас вывелась другая версия, замените
+`PYTHON_VERSION` в `Dockerfile` ниже на неё.
+
+**Dockerfile.** Версии провайдеров фиксируются через официальный constraints-файл
+Airflow — это файл, который сама команда Apache Airflow публикует под каждый релиз,
+с гарантированно протестированным набором совместимых версий всех пакетов
+экосистемы (а не «последние на момент сборки», которые могут внезапно конфликтовать
+друг с другом):
+```bash
+mkdir -p /var/storage/containers/airflow-image
+cat > /var/storage/containers/airflow-image/Dockerfile <<'EOF'
+FROM docker.getcollate.io/openmetadata/ingestion:1.13.6
+
+ARG AIRFLOW_VERSION=3.3.1
+ARG PYTHON_VERSION=3.12
+ARG CONSTRAINTS_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
+
+RUN pip install --no-cache-dir --constraint "${CONSTRAINTS_URL}" \
+    apache-airflow-providers-dbt-cloud \
+    apache-airflow-providers-http \
+    apache-airflow-providers-jdbc \
+    apache-airflow-providers-odbc \
+    apache-airflow-providers-microsoft-mssql \
+    apache-airflow-providers-postgres \
+    apache-airflow-providers-samba \
+    apache-airflow-providers-sftp \
+    apache-airflow-providers-ssh \
+    apache-airflow-providers-fab \
+    apache-airflow-providers-celery
+EOF
+```
+
+**Сборка** (один раз, на самом сервере — без внешнего registry, локальный тег
+достаточно, раз образ используется только на этом хосте):
+```bash
+podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
+```
+
+Дальше во всех Quadlet-файлах Airflow-контейнеров (`Image=`) используется
+`localhost/etl-airflow:1.13.6` вместо `docker.getcollate.io/openmetadata/ingestion:1.13.6`
+напрямую — OpenMetadata Server и Migrate (Шаг 3 ниже) провайдеры не нужны, поэтому
+их `Image=` не меняется.
+
+> Если когда-нибудь понадобится больше одного сервера (несколько worker-хостов,
+> HA) — локальный тег `localhost/...` перестанет работать: его видит только
+> Podman на этой машине. Тогда нужен настоящий registry (свой Harbor/Nexus,
+> либо push в `docker.getcollate.io`-совместимый приватный реестр) и `Image=`
+> со полным адресом реестра вместо `localhost/...`. Для одного сервера, как
+> здесь, локальный тег — самый простой рабочий вариант.
 
 ### PostgreSQL (localhost)
 ```bash
@@ -367,20 +443,19 @@ EOF
 > - логин по-прежнему через `airflow users create`, но только если явно подключить
 >   `FabAuthManager` — новый дефолт в Airflow 3 его не использует.
 >
-> Прежде чем катить в прод, сверьте на образе то же самое, что и раньше (UID
-> пользователя, обработку `_PIP_ADDITIONAL_REQUIREMENTS`, наличие `curl`), плюс то,
-> что реально поменялось с версией:
-> ```bash
-> podman run --rm --entrypoint id docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow
-> podman run --rm --entrypoint cat docker.getcollate.io/openmetadata/ingestion:1.13.6 \
->     /entrypoint | grep -i PIP_ADDITIONAL
-> podman run --rm --entrypoint which docker.getcollate.io/openmetadata/ingestion:1.13.6 curl
-> # Версия Airflow внутри образа — должно быть 3.3.1
-> podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow version
-> # CLI действительно понимает новые подкоманды
-> podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow api-server --help
-> podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow dag-processor --help
-> ```
+> **Проверено на реальном образе** (все пункты прогнаны и подтверждены):
+> - UID пользователя `airflow` — `50000` (совпадает с `chown -R 50000:0`, Шаг 1);
+> - `pip`/сеть внутри образа рабочие — база для `RUN pip install` в `Dockerfile`
+>   (Шаг 3, «Кастомный образ Airflow») отработала без проблем;
+> - `curl` есть, `/usr/bin/curl` — на нём построены `HealthCmd` ниже;
+> - `airflow version` → **3.3.1**, ровно как заявлено в changelog OpenMetadata;
+> - `airflow api-server --help` и `airflow dag-processor --help` — обе подкоманды
+>   существуют, флаг `--proxy-headers` у `api-server` на месте;
+> - `airflow celery flower --help` (после установки `apache-airflow-providers-celery`,
+>   см. `Dockerfile` в Шаге 3) — флаги `-A/--basic-auth` и `-u/--url-prefix`
+>   подтверждены, ровно то, что уже используется в `Command=` Flower ниже.
+>
+> Дополнительной проверки перед деплоем не требуется.
 
 ```bash
 cat > /etc/containers/systemd/airflow-init.container <<'EOF'
@@ -390,13 +465,12 @@ After=postgres.service rabbitmq.service
 Requires=postgres.service rabbitmq.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-init
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 Volume=/var/storage/containers/init-airflow.sh:/init-airflow.sh:ro,z
 Network=etl.network
 Entrypoint=/bin/bash
@@ -412,16 +486,18 @@ EOF
 ```
 
 > `Entrypoint=/bin/bash` + `Command=/init-airflow.sh` подменяют штатный entrypoint
-> образа — из-за этого `_PIP_ADDITIONAL_REQUIREMENTS` (задаётся в `etl.env`, Шаг 6) тут
-> не отрабатывает, и это нормально: `db migrate`/`users create` провайдерам не нужны.
+> образа — но это уже не имеет значения для провайдеров: они зашиты в сам образ
+> `localhost/etl-airflow:1.13.6` через `Dockerfile` (Шаг 3), а не ставятся entrypoint'ом
+> при старте, так что `db migrate`/`users create` видят их независимо от того, какой
+> entrypoint используется в конкретном контейнере.
 > `Type=oneshot` + `RemainAfterExit=yes` — юнит считается «активным» после завершения
 > команды, а не всё время работы; на этом основан `Requires=airflow-init.service` у
 > всех остальных Airflow-компонентов — systemd не пустит их, пока миграция БД и
 > создание админа не завершатся успешно. `airflow users create` работает и в Airflow 3,
-> но только когда установлен и подключён `apache-airflow-providers-fab` (см.
-> `_PIP_ADDITIONAL_REQUIREMENTS` и `AIRFLOW__CORE__AUTH_MANAGER` в Шаге 6) — без этого
-> команда либо не найдётся, либо созданный пользователь не сможет залогиниться через
-> обычную форму логина.
+> но только когда установлен и подключён `apache-airflow-providers-fab` (ставится в
+> `Dockerfile`, Шаг 3; подключается через `AIRFLOW__CORE__AUTH_MANAGER` в `etl.env`,
+> Шаг 6) — без этого команда либо не найдётся, либо созданный пользователь не сможет
+> залогиниться через обычную форму логина.
 
 ### Airflow API Server
 ```bash
@@ -432,7 +508,7 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-api-server
 NetworkAlias=airflow-api-server
 EnvironmentFile=/var/storage/containers/etl.env
@@ -440,7 +516,6 @@ Environment=FORWARDED_ALLOW_IPS=*
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 PublishPort=127.0.0.1:8080:8080
 Network=etl.network
 Command=api-server --proxy-headers
@@ -491,13 +566,12 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-scheduler
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 Network=etl.network
 Command=scheduler
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type SchedulerJob --hostname "$HOSTNAME"'
@@ -529,13 +603,12 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-dag-processor
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 Network=etl.network
 Command=dag-processor
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type DagProcessorJob --hostname "$HOSTNAME"'
@@ -568,13 +641,12 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-triggerer
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 Network=etl.network
 Command=triggerer
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type TriggererJob --hostname "$HOSTNAME"'
@@ -604,13 +676,12 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-worker
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 Network=etl.network
 Command=celery worker
 HealthCmd=/bin/bash -c 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME"'
@@ -646,14 +717,13 @@ After=postgres.service rabbitmq.service airflow-init.service
 Requires=postgres.service rabbitmq.service airflow-init.service
 
 [Container]
-Image=docker.getcollate.io/openmetadata/ingestion:1.13.6
+Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-flower
 NetworkAlias=airflow-flower
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
-Volume=/var/storage/containers/airflow/python-deps:/home/airflow/.local:z
 PublishPort=127.0.0.1:5555:5555
 Network=etl.network
 Command=celery flower --url-prefix=flower --basic-auth=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
@@ -680,12 +750,11 @@ EOF
 >
 > `--url-prefix=flower` и флаги через дефис (`--basic-auth`, не `--basic_auth`) —
 > потому что `celery flower` здесь фактически вызывается как `airflow celery flower`
-> (через entrypoint образа, так же как `Command=scheduler` реально означает
-> `airflow scheduler`), а не как отдельный пакет `flower` — у CLI-обёртки Airflow
-> имена флагов другие, чем в документации самого Flower. Эта часть не зависит от
-> перехода webserver→api-server (Flower — отдельная подсистема Celery-экосистемы),
-> но флаги стоит один раз перепроверить на новой версии образа тем же способом, что
-> и раньше: `podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow celery flower --help`.
+> (через `apache-airflow-providers-celery`, зашитый в `Dockerfile`, Шаг 3 — без него
+> команды `celery worker`/`celery flower` не существуют вообще, в CLI нет даже группы
+> `celery`), а не как отдельный пакет `flower` — у CLI-обёртки Airflow имена флагов
+> другие, чем в документации самого Flower. Оба флага (`-A/--basic-auth`,
+> `-u/--url-prefix`) подтверждены на реальном образе.
 
 ### Nginx (внешний доступ)
 ```bash
@@ -1081,8 +1150,12 @@ curl -s http://localhost:9200/_snapshot/etl_backup_repo/_all | grep -o '"snapsho
 ## Шаг 6. Скрипт развертывания (`deploy.sh`)
 
 > Провайдеры данных Airflow (dbt-cloud, http, jdbc, odbc, mssql, postgres, samba, sftp,
-> ssh) задаются переменной `_PIP_ADDITIONAL_REQUIREMENTS` внутри генерации `etl.env`
-> ниже (шаг «Формирование etl.env»).
+> ssh, fab, celery) в `etl.env` больше не упоминаются — они зашиты в сборку
+> `localhost/etl-airflow:1.13.6` через `Dockerfile` (Шаг 3, «Кастомный образ
+> Airflow»), с версиями, зафиксированными официальным constraints-файлом Airflow.
+> Если этот образ ещё не собран — `deploy.sh` ниже упадёт на первом же
+> `systemctl start airflow-init` с ошибкой «image not found», см. проверку в начале
+> скрипта.
 
 ```bash
 cat > /var/storage/containers/deploy.sh <<'DEPLOY'
@@ -1095,6 +1168,14 @@ SECRETS="$CONTAINERS_DIR/secrets.env"
 ENV="$CONTAINERS_DIR/etl.env"
 NETWORK_FILE="/etc/containers/systemd/etl.network"
 IP=$(hostname -I | awk '{print $1}')
+
+# ── Проверка: кастомный образ Airflow должен быть уже собран (Шаг 3) ──
+if ! podman image exists localhost/etl-airflow:1.13.6; then
+    echo "ОШИБКА: localhost/etl-airflow:1.13.6 не найден." >&2
+    echo "Соберите его сначала (Шаг 3, «Кастомный образ Airflow»):" >&2
+    echo "  podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image" >&2
+    exit 1
+fi
 
 # ── 0. Подбор свободной подсети для etl-network ──────────
 pick_free_subnet() {
@@ -1230,7 +1311,6 @@ POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
 POSTGRES_DB=airflow
 RABBITMQ_DEFAULT_USER=airflow
 RABBITMQ_DEFAULT_PASS=${RABBITMQ_PASS}
-_PIP_ADDITIONAL_REQUIREMENTS=apache-airflow-providers-dbt-cloud apache-airflow-providers-http apache-airflow-providers-jdbc apache-airflow-providers-odbc apache-airflow-providers-microsoft-mssql apache-airflow-providers-postgres apache-airflow-providers-samba apache-airflow-providers-sftp apache-airflow-providers-ssh apache-airflow-providers-fab apache-airflow[celery]
 AIRFLOW__CORE__EXECUTOR=CeleryExecutor
 AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
 AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@postgres:5432/airflow
@@ -1319,8 +1399,10 @@ wait_healthy etl-elasticsearch 90
 
 systemctl start airflow-init
 
-systemctl start airflow-webserver airflow-scheduler airflow-worker airflow-flower
-wait_healthy etl-airflow-webserver 60
+systemctl start airflow-api-server airflow-scheduler airflow-dag-processor airflow-triggerer airflow-worker airflow-flower
+wait_healthy etl-airflow-api-server 60
+wait_healthy etl-airflow-dag-processor 60
+wait_healthy etl-airflow-triggerer 60
 wait_healthy etl-airflow-flower 60
 
 systemctl start openmetadata-migrate
@@ -1331,8 +1413,8 @@ systemctl start nginx
 
 echo "[6/8] Включение автозапуска..."
 systemctl enable postgres rabbitmq elasticsearch \
-    airflow-init airflow-webserver airflow-scheduler \
-    airflow-worker airflow-flower \
+    airflow-init airflow-api-server airflow-scheduler \
+    airflow-dag-processor airflow-triggerer airflow-worker airflow-flower \
     openmetadata-migrate openmetadata-server nginx
 
 echo "[7/8] Включение таймера бэкапов..."
@@ -1420,11 +1502,12 @@ podman exec etl-airflow-worker airflow providers list
 │   ├── etl.env                  ← chmod 600
 │   ├── init-db.sql              ← chmod 600
 │   ├── init-airflow.sh
+│   ├── airflow-image/
+│   │   └── Dockerfile           ← FROM openmetadata/ingestion, провайдеры
 │   ├── airflow/
 │   │   ├── dags/
 │   │   ├── logs/
-│   │   ├── plugins/
-│   │   └── python-deps/
+│   │   └── plugins/
 │   ├── rabbitmq/
 │   │   └── rabbitmq.conf
 │   └── nginx/
@@ -1445,8 +1528,10 @@ podman exec etl-airflow-worker airflow providers list
 ├── rabbitmq.container
 ├── elasticsearch.container
 ├── airflow-init.container
-├── airflow-webserver.container
+├── airflow-api-server.container
 ├── airflow-scheduler.container
+├── airflow-dag-processor.container
+├── airflow-triggerer.container
 ├── airflow-worker.container
 ├── airflow-flower.container
 ├── nginx.container
@@ -1458,6 +1543,11 @@ podman exec etl-airflow-worker airflow providers list
 └── etl-backup.timer
 ```
 
+Образ `localhost/etl-airflow:1.13.6` (Шаг 3) — не файл на этой файловой системе, а
+собранный `podman build` образ, лежит в локальном хранилище Podman
+(`podman images` покажет). `airflow-image/Dockerfile` — это исходник, из которого он
+собирается, а не сам образ.
+
 ---
 
 ## Управление
@@ -1465,11 +1555,12 @@ podman exec etl-airflow-worker airflow providers list
 ```bash
 # Статус
 systemctl status postgres rabbitmq elasticsearch \
-    airflow-webserver airflow-scheduler airflow-worker \
+    airflow-api-server airflow-scheduler airflow-dag-processor airflow-triggerer airflow-worker \
     openmetadata-server nginx
 
 # Логи
 journalctl -u airflow-scheduler -f
+journalctl -u airflow-dag-processor -f
 journalctl -u openmetadata-server -f
 journalctl -u etl-backup.service
 
@@ -1479,9 +1570,16 @@ systemctl start etl-backup.service
 # Перезапуск
 systemctl restart airflow-worker
 
+# Пересборка образа Airflow после правки Dockerfile (Шаг 3) — версии
+# провайдеров или базовый тег изменились
+podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
+systemctl restart airflow-init airflow-api-server airflow-scheduler \
+    airflow-dag-processor airflow-triggerer airflow-worker airflow-flower
+
 # Остановка всего
 systemctl stop openmetadata-server nginx \
-    airflow-webserver airflow-scheduler airflow-worker airflow-flower \
+    airflow-api-server airflow-scheduler airflow-dag-processor airflow-triggerer \
+    airflow-worker airflow-flower \
     elasticsearch rabbitmq postgres
 
 # После reboot всё запустится автоматически (включая таймер бэкапов)

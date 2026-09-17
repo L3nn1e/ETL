@@ -260,7 +260,7 @@ cat > /var/storage/containers/airflow-image/Dockerfile <<'EOF'
 FROM docker.getcollate.io/openmetadata/ingestion:1.13.6
 
 ARG AIRFLOW_VERSION=3.3.1
-ARG PYTHON_VERSION=3.12.13
+ARG PYTHON_VERSION=3.12
 ARG CONSTRAINTS_URL="https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt"
 
 RUN pip install --no-cache-dir --constraint "${CONSTRAINTS_URL}" \

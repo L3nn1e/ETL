@@ -281,7 +281,7 @@ EOF
 **Сборка** (один раз, на самом сервере — без внешнего registry, локальный тег
 достаточно, раз образ используется только на этом хосте):
 ```bash
-podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
+podman build --format docker -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
 ```
 
 Дальше во всех Quadlet-файлах Airflow-контейнеров (`Image=`) используется

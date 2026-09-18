@@ -298,7 +298,6 @@ podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-ima
 
 ### PostgreSQL (localhost)
 ```bash
-cat > /etc/containers/systemd/postgres.container <<'EOF'
 [Unit]
 Description=PostgreSQL
 After=network-online.target
@@ -324,7 +323,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > Лимиты под сервер 32 ГБ / 4-8 vCPU: `shared_buffers` ~25% лимита (1GB),

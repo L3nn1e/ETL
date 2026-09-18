@@ -1168,7 +1168,6 @@ curl -s http://localhost:9200/_snapshot/etl_backup_repo/_all | grep -o '"snapsho
 > скрипта.
 
 ```bash
-cat > /var/storage/containers/deploy.sh <<'DEPLOY'
 #!/bin/bash
 set -e
 
@@ -1346,7 +1345,7 @@ DB_HOST=postgres
 DB_PORT=5432
 DB_USER=openmetadata_user
 DB_USER_PASSWORD=${OPENMETADATA_DB_PASSWORD}
-DB_PARAMS=allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+DB_PARAMS=sslmode=disable
 SEARCH_TYPE=elasticsearch
 ELASTICSEARCH_HOST=elasticsearch
 ELASTICSEARCH_PORT=9200
@@ -1455,9 +1454,7 @@ echo " Бэкапы: /var/storage/backups (ежедневно 03:00, тайме�
 echo "   Postgres + ElasticSearch-снапшоты + RabbitMQ-определения + конфигурация)"
 echo " Секреты: $SECRETS"
 echo "============================================"
-DEPLOY
 
-chmod +x /var/storage/containers/deploy.sh
 ```
 
 ---

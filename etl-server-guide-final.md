@@ -627,7 +627,6 @@ WantedBy=multi-user.target
 
 ### Airflow Triggerer
 ```bash
-cat > /etc/containers/systemd/airflow-triggerer.container <<'EOF'
 [Unit]
 Description=Airflow Triggerer
 After=postgres.service rabbitmq.service airflow-init.service
@@ -642,8 +641,9 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
 Exec=triggerer
-HealthCmd=/bin/bash -c 'airflow jobs check --job-type TriggererJob --hostname "$HOSTNAME"'
-HealthInterval=30s
+ HealthCmd=kill -0 1
+HealthStartPeriod=60s
+HealthInterval=15s
 HealthRetries=5
 PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
 
@@ -652,7 +652,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > Обслуживает deferrable-операторы (асинхронное ожидание без занятого worker-слота) —

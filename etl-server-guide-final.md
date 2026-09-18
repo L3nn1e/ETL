@@ -701,7 +701,6 @@ WantedBy=multi-user.target
 
 ### Airflow Flower (за nginx, localhost)
 ```bash
-cat > /etc/containers/systemd/airflow-flower.container <<'EOF'
 [Unit]
 Description=Airflow Flower
 After=postgres.service rabbitmq.service airflow-init.service
@@ -717,9 +716,8 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 PublishPort=127.0.0.1:5555:5555
 Network=etl.network
-Entrypoint=/bin/bash
-Exec=-c "exec celery flower --url-prefix=flower --basic-auth=\$FLOWER_ADMIN_USER:\$FLOWER_ADMIN_PASS"
-HealthCmd=/bin/bash -c "curl -sf -u \$FLOWER_ADMIN_USER:\$FLOWER_ADMIN_PASS http://localhost:5555/flower/"
+Exec=celery flower --url-prefix=flower --basic-auth=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
+HealthCmd=kill -0 1
 HealthInterval=15s
 HealthRetries=6
 PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
@@ -729,7 +727,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > **`${VAR}` прямо в `Exec=`/`HealthCmd=` — ненадёжно, экранированный `\$VAR` внутри

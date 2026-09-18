@@ -455,7 +455,6 @@ WantedBy=multi-user.target
 > Дополнительной проверки перед деплоем не требуется.
 
 ```bash
-cat > /etc/containers/systemd/airflow-init.container <<'EOF'
 [Unit]
 Description=Airflow Init
 After=postgres.service rabbitmq.service
@@ -479,7 +478,7 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > `Entrypoint=/bin/bash` + `Exec=/init-airflow.sh` подменяют штатный entrypoint

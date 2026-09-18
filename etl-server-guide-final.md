@@ -590,7 +590,6 @@ WantedBy=multi-user.target
 
 ### Airflow Dag Processor
 ```bash
-cat > /etc/containers/systemd/airflow-dag-processor.container <<'EOF'
 [Unit]
 Description=Airflow Dag Processor
 After=postgres.service rabbitmq.service airflow-init.service
@@ -605,7 +604,7 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
 Exec=dag-processor
-HealthCmd=/bin/bash -c 'airflow jobs check --job-type DagProcessorJob --hostname "$HOSTNAME"'
+HealthCmd=kill -0 1
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=1g --memory-swap=1g --cpus=1
@@ -615,7 +614,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > **Новый в Airflow 3, обязательный.** В Airflow 2 парсингом DAG-файлов занимался

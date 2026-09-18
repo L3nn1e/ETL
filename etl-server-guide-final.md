@@ -381,7 +381,6 @@ EOF
 
 ### ElasticSearch (localhost)
 ```bash
-cat > /etc/containers/systemd/elasticsearch.container <<'EOF'
 [Unit]
 Description=ElasticSearch
 After=network-online.target
@@ -409,7 +408,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > `Xms` всегда равен `Xmx` — иначе JVM ресайзит кучу под нагрузкой, что даёт

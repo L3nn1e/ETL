@@ -337,7 +337,6 @@ WantedBy=multi-user.target
 
 ### RabbitMQ (localhost)
 ```bash
-cat > /etc/containers/systemd/rabbitmq.container <<'EOF'
 [Unit]
 Description=RabbitMQ
 After=network-online.target
@@ -363,7 +362,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 Erlang VM в RabbitMQ 3.13 определяет доступную память через `/proc/meminfo` хоста, а не

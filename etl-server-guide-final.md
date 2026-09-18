@@ -497,7 +497,6 @@ WantedBy=multi-user.target
 
 ### Airflow API Server
 ```bash
-cat > /etc/containers/systemd/airflow-api-server.container <<'EOF'
 [Unit]
 Description=Airflow API Server
 After=postgres.service rabbitmq.service airflow-init.service
@@ -515,7 +514,7 @@ Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 PublishPort=127.0.0.1:8080:8080
 Network=etl.network
 Exec=api-server --proxy-headers
-HealthCmd=/bin/bash -c 'curl -sf http://localhost:8080/airflow/api/v2/monitor/health || curl -sf http://localhost:8080/api/v2/monitor/health'
+HealthCmd=kill -0 1
 HealthInterval=10s
 HealthRetries=6
 PodmanArgs=--memory=1g --memory-swap=1g --cpus=1
@@ -525,7 +524,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > **Переименовано из "Airflow Webserver".** В Airflow 3 `webserver` (Flask, REST API

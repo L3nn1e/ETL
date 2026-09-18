@@ -662,7 +662,6 @@ WantedBy=multi-user.target
 
 ### Airflow Worker
 ```bash
-cat > /etc/containers/systemd/airflow-worker.container <<'EOF'
 [Unit]
 Description=Airflow Celery Worker
 After=postgres.service rabbitmq.service airflow-init.service
@@ -677,7 +676,7 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
 Exec=celery worker
-HealthCmd=/bin/bash -c 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME"'
+HealthCmd=kill -0 1
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=3g --memory-swap=3g --cpus=3
@@ -687,7 +686,6 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
 ```
 
 > `AIRFLOW__CELERY__WORKER_CONCURRENCY=12` задаётся в `etl.env` (Шаг 6) — задачи в

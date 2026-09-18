@@ -554,7 +554,6 @@ WantedBy=multi-user.target
 
 ### Airflow Scheduler
 ```bash
-cat > /etc/containers/systemd/airflow-scheduler.container <<'EOF'
 [Unit]
 Description=Airflow Scheduler
 After=postgres.service rabbitmq.service airflow-init.service
@@ -569,7 +568,7 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
 Exec=scheduler
-HealthCmd=/bin/bash -c 'airflow jobs check --job-type SchedulerJob --hostname "$HOSTNAME"'
+HealthCmd=kill -0 1
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=1.5g --memory-swap=1.5g --cpus=1
@@ -579,7 +578,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-EOF
+
 ```
 
 > В Airflow 3 scheduler **больше не парсит DAG-файлы сам** — только триггерит запуски

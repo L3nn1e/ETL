@@ -23,7 +23,7 @@ OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/`
 ## Архитектура
 
 ```
-┌───────────────────────────────────────────────────────────────┐
+┌─────────────────────────────────────────────────────────────┐
 │                    ВНЕШНИЕ СИСТЕМЫ                            │
 │  (MSSQL, PostgreSQL, SFTP, REST API, dbt, файлы)              │
 └──────────────┬─────────────────────────┬──────────────────────┘
@@ -31,29 +31,29 @@ OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/`
                │ Провайдеры Airflow      │ Коннекторы OpenMetadata
                │ (движение данных, ETL)  │ (чтение метаданных)
                ▼                         ▼
-        ┌──────────────────────────────────────────┐
+        ┌────────────────────────────────────────┐
         │     Airflow DAGs — единый кластер        │
         │  ETL-процессы  +  ingestion-пайплайны    │
         └────────────────────┬─────────────────────┘
                               │ Задачи через RabbitMQ
                               ▼
-                  ┌───────────────────────────┐
+                  ┌─────────────────────────┐
                   │      Airflow Workers      │
                   │    (выполнение задач)     │
                   └─────┬───────────────┬─────┘
        Результаты ETL   │               │  Метаданные из ingestion-DAG'ов
        (целевые         │               │  (HTTP API → OpenMetadata Server)
         системы/DWH)    ▼               ▼
-                                  ┌─────────────────────────────┐
-                                  │   OpenMetadata Server       │
-                                  │  (хранение метаданных)      │
+                                  ┌──────────────────────────┐
+                                  │   OpenMetadata Server      │
+                                  │  (хранение метаданных)     │
                                   └────────────┬────────────────┘
                                                │ PostgreSQL + ElasticSearch
                                                ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                    ХРАНИЛИЩЕ ДАННЫХ                         │
-│  PostgreSQL (airflow + openmetadata_db)                     │
-│  ElasticSearch (индексы метаданных)                         │
+│                    ХРАНИЛИЩЕ ДАННЫХ                            │
+│  PostgreSQL (airflow + openmetadata_db)                        │
+│  ElasticSearch (индексы метаданных)                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -281,7 +281,7 @@ EOF
 **Сборка** (один раз, на самом сервере — без внешнего registry, локальный тег
 достаточно, раз образ используется только на этом хосте):
 ```bash
-podman build --format docker -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
+podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-image
 ```
 
 Дальше во всех Quadlet-файлах Airflow-контейнеров (`Image=`) используется
@@ -317,7 +317,7 @@ HealthCmd=pg_isready -U airflow
 HealthInterval=10s
 HealthRetries=5
 PodmanArgs=--memory=4g --memory-swap=4g --cpus=2
-Command=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=100 -c work_mem=16MB -c maintenance_work_mem=256MB
+Exec=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=100 -c work_mem=16MB -c maintenance_work_mem=256MB
 
 [Service]
 Restart=always
@@ -453,7 +453,7 @@ EOF
 >   существуют, флаг `--proxy-headers` у `api-server` на месте;
 > - `airflow celery flower --help` (после установки `apache-airflow-providers-celery`,
 >   см. `Dockerfile` в Шаге 3) — флаги `-A/--basic-auth` и `-u/--url-prefix`
->   подтверждены, ровно то, что уже используется в `Command=` Flower ниже.
+>   подтверждены, ровно то, что уже используется в `Exec=` Flower ниже.
 >
 > Дополнительной проверки перед деплоем не требуется.
 
@@ -474,7 +474,7 @@ Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/init-airflow.sh:/init-airflow.sh:ro,z
 Network=etl.network
 Entrypoint=/bin/bash
-Command=/init-airflow.sh
+Exec=/init-airflow.sh
 
 [Service]
 Type=oneshot
@@ -485,7 +485,7 @@ WantedBy=multi-user.target
 EOF
 ```
 
-> `Entrypoint=/bin/bash` + `Command=/init-airflow.sh` подменяют штатный entrypoint
+> `Entrypoint=/bin/bash` + `Exec=/init-airflow.sh` подменяют штатный entrypoint
 > образа — но это уже не имеет значения для провайдеров: они зашиты в сам образ
 > `localhost/etl-airflow:1.13.6` через `Dockerfile` (Шаг 3), а не ставятся entrypoint'ом
 > при старте, так что `db migrate`/`users create` видят их независимо от того, какой
@@ -518,7 +518,7 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 PublishPort=127.0.0.1:8080:8080
 Network=etl.network
-Command=api-server --proxy-headers
+Exec=api-server --proxy-headers
 HealthCmd=/bin/bash -c 'curl -sf http://localhost:8080/airflow/api/v2/monitor/health || curl -sf http://localhost:8080/api/v2/monitor/health'
 HealthInterval=10s
 HealthRetries=6
@@ -573,7 +573,7 @@ Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
-Command=scheduler
+Exec=scheduler
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type SchedulerJob --hostname "$HOSTNAME"'
 HealthInterval=30s
 HealthRetries=5
@@ -610,7 +610,7 @@ Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
-Command=dag-processor
+Exec=dag-processor
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type DagProcessorJob --hostname "$HOSTNAME"'
 HealthInterval=30s
 HealthRetries=5
@@ -648,7 +648,7 @@ Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
-Command=triggerer
+Exec=triggerer
 HealthCmd=/bin/bash -c 'airflow jobs check --job-type TriggererJob --hostname "$HOSTNAME"'
 HealthInterval=30s
 HealthRetries=5
@@ -683,7 +683,7 @@ Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Network=etl.network
-Command=celery worker
+Exec=celery worker
 HealthCmd=/bin/bash -c 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME" || celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$HOSTNAME"'
 HealthInterval=30s
 HealthRetries=5
@@ -726,8 +726,9 @@ Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 PublishPort=127.0.0.1:5555:5555
 Network=etl.network
-Command=celery flower --url-prefix=flower --basic-auth=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
-HealthCmd=curl -sf -u ${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS} http://localhost:5555/flower/
+Entrypoint=/bin/bash
+Exec=-c "exec celery flower --url-prefix=flower --basic-auth=\$FLOWER_ADMIN_USER:\$FLOWER_ADMIN_PASS"
+HealthCmd=/bin/bash -c "curl -sf -u \$FLOWER_ADMIN_USER:\$FLOWER_ADMIN_PASS http://localhost:5555/flower/"
 HealthInterval=15s
 HealthRetries=6
 PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
@@ -740,13 +741,20 @@ WantedBy=multi-user.target
 EOF
 ```
 
-> **Подстановка `${FLOWER_ADMIN_USER}`/`${FLOWER_ADMIN_PASS}` в `Command=`/`HealthCmd=`
-> работает через systemd, не через shell.** Это не heredoc-интерполяция (тут кавычки
-> `'EOF'` как раз запрещают её) — systemd сам подставляет `$VAR`/`${VAR}` в
-> `ExecStart=` из окружения юнита, а `EnvironmentFile=/var/storage/containers/etl.env`
-> прямо здесь это окружение и формирует. Both переменные должны быть в `etl.env`
-> (Шаг 6) до первого старта контейнера — иначе подставится пустая строка, и
-> `--basic-auth=:` завершится ошибкой при старте Flower.
+> **`${VAR}` прямо в `Exec=`/`HealthCmd=` — ненадёжно, экранированный `\$VAR` внутри
+> `bash -c` — надёжно.** Раньше здесь стояла подстановка вида
+> `Exec=celery flower --basic-auth=${FLOWER_ADMIN_USER}:...` в расчёте на то, что
+> systemd сам заменит `${VAR}` значениями из `EnvironmentFile=` при генерации
+> `ExecStart=`. У этого есть неочевидная зависимость от того, на каком этапе разбора
+> юнита переменные из `EnvironmentFile=` вообще становятся видны механизму
+> `$VAR`-подстановки — гарантии тут меньше, чем кажется. Надёжнее не полагаться на
+> это вообще: `Entrypoint=/bin/bash` + `Exec=-c "... \$VAR"` с экранированным `\$`
+> (чтобы systemd НЕ трогал переменную на этапе генерации) откладывает подстановку до
+> момента, когда команда реально выполняется **внутри контейнера** — там `$VAR` берёт
+> обычная shell-интерполяция bash из процессного окружения, которое `EnvironmentFile=`
+> гарантированно туда прокидывает (через `--env-file` у podman). То же самое и для
+> `HealthCmd=` — оборачиваем в `/bin/bash -c "..."` с тем же экранированием, по той же
+> причине.
 >
 > `--url-prefix=flower` и флаги через дефис (`--basic-auth`, не `--basic_auth`) —
 > потому что `celery flower` здесь фактически вызывается как `airflow celery flower`
@@ -800,7 +808,7 @@ Wants=network-online.target
 Image=docker.getcollate.io/openmetadata/server:1.13.6
 ContainerName=execute-migrate-all
 EnvironmentFile=/var/storage/containers/etl.env
-Command=./bootstrap/openmetadata-ops.sh migrate
+Exec=./bootstrap/openmetadata-ops.sh migrate
 Network=etl.network
 
 [Service]
@@ -833,7 +841,7 @@ EnvironmentFile=/var/storage/containers/etl.env
 Environment=OPENMETADATA_HEAP_OPTS=-Xms1g -Xmx1g
 PublishPort=127.0.0.1:8585:8585
 Network=etl.network
-HealthCmd=curl -sf http://localhost:8585/openmetadata/api/v1/system/version
+HealthCmd=wget -qO- http://localhost:8585/openmetadata/api/v1/system/version > /dev/null
 HealthInterval=10s
 HealthRetries=10
 PodmanArgs=--memory=2g --memory-swap=2g --cpus=1
@@ -860,9 +868,9 @@ EOF
 > API стоит свериться на реальном контейнере перед тем, как полагаться на него в
 > healthcheck выше и в `AIRFLOW_HOST` ниже:
 > ```bash
-> curl -sf http://localhost:8585/openmetadata/api/v1/system/version
+> wget -qO- http://localhost:8585/openmetadata/api/v1/system/version
 > ```
-> Если путь соберётся иначе — поправьте `HealthCmd` здесь и адрес в `curl` внутри
+> Если путь соберётся иначе — поправьте `HealthCmd` здесь и адрес в `wget` внутри
 > `wait_healthy` (Шаг 6).
 >
 > **`AIRFLOW_HOST` — не тот URL, что раньше.** До Airflow 3 OpenMetadata просто ходил
@@ -870,10 +878,12 @@ EOF
 > `airflow-api-server`, (2) API — v2, (3) неизвестно заранее, требует ли реальный
 > маршрут префикс `/airflow` (см. примечание к `Airflow API Server` в Шаге 3 — тот же
 > вопрос, что и с `HealthCmd`). Проверьте после деплоя, какой из вариантов отвечает,
-> и пропишите рабочий в `AIRFLOW_HOST`:
+> и пропишите рабочий в `AIRFLOW_HOST` — командой `wget`, а не `curl`: `curl` в образе
+> `openmetadata/server` может отсутствовать (в отличие от `openmetadata/ingestion`, где
+> он подтверждён), поэтому запускать эти проверки нужно через `wget` внутри контейнера:
 > ```bash
-> podman exec etl-om-server curl -sf http://airflow-api-server:8080/airflow/api/v2/monitor/health
-> podman exec etl-om-server curl -sf http://airflow-api-server:8080/api/v2/monitor/health
+> podman exec etl-om-server wget -qO- http://airflow-api-server:8080/airflow/api/v2/monitor/health
+> podman exec etl-om-server wget -qO- http://airflow-api-server:8080/api/v2/monitor/health
 > ```
 > Отдельный риск — сама интеграция: OM 1.13.6 официально поддерживает триггер
 > ingestion-пайплайнов через Airflow 3.x (в changelog 1.13.5 есть фикс именно для

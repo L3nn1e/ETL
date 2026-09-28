@@ -6,7 +6,7 @@ Quadlets, AlmaLinux 10.2. Airflow один: обслуживает и ETL-DAG'и
 MSSQL/SFTP/Samba/SSH/JDBC/ODBC/dbt/HTTP), и ingestion-пайплайны OpenMetadata,
 зарегистрированные как Pipeline Service «Airflow» — отдельного встроенного Airflow
 внутри OpenMetadata не разворачивается. Внутренние сервисы (Postgres, RabbitMQ,
-ElasticSearch, Airflow Flower, Airflow webserver, OpenMetadata Server) слушают только
+ElasticSearch, Airflow Flower, Airflow API Server, OpenMetadata Server) слушают только
 `127.0.0.1`; наружу смотрит только один порт — 80, nginx разводит Airflow UI,
 OpenMetadata и Flower по путям `/airflow/`, `/openmetadata/`, `/flower/` (последний —
 за отдельным логином, поверх общей точки входа). Подсеть
@@ -69,7 +69,7 @@ HTTP API между Airflow и OpenMetadata Server работает в обе с
 - **Server → Airflow** (не показано на схеме отдельной стрелкой, т.к. идёт не через
   Worker, а напрямую к api-server) — OpenMetadata **запускает** ingestion-DAG'и
   через Airflow REST API. Это и есть Pipeline Service «Airflow», настроенный через
-  `AIRFLOW_HOST`/`PIPELINE_SERVICE_CLIENT_ENABLED` в `etl.env` (Шаг 6).
+  `PIPELINE_SERVICE_CLIENT_ENDPOINT`/`PIPELINE_SERVICE_CLIENT_ENABLED` в `etl.env` (Шаг 6).
 
 ### Версии компонентов
 
@@ -176,7 +176,7 @@ sysctl -p /etc/sysctl.d/99-elasticsearch.conf
 
 # Каталоги
 mkdir -p /var/storage/volumes/{postgres,rabbitmq,elasticsearch}
-mkdir -p /var/storage/containers/{airflow/{dags,logs,plugins},nginx}
+mkdir -p /var/storage/containers/{airflow/{dags,logs,plugins,dag_generated_configs},nginx}
 mkdir -p /var/storage/backups
 mkdir -p /etc/containers/systemd
 
@@ -188,10 +188,7 @@ chmod 700 /var/storage/volumes/rabbitmq
 chown -R 1000:1000 /var/storage/volumes/elasticsearch
 chmod 700 /var/storage/volumes/elasticsearch
 
-# Права для Airflow (UID 50000 в apache/airflow — сверьте, что тот же UID
-# используется и в docker.getcollate.io/openmetadata/ingestion, см. примечание
-# к образу в Шаге 3):
-# podman run --rm --entrypoint id docker.getcollate.io/openmetadata/ingestion:1.13.6 airflow
+# Права для Airflow: UID 50000 (проверено на образе openmetadata/ingestion:1.13.6)
 chown -R 50000:0 /var/storage/containers/airflow
 ```
 
@@ -244,8 +241,10 @@ Airflow не поднимется вообще, хотя раньше работ
 **Узнать версию Python внутри базового образа** — она нужна, чтобы взять правильный
 constraints-файл (см. ниже):
 ```bash
-podman run --rm docker.getcollate.io/openmetadata/ingestion:1.13.6 python3 --version
+podman run --rm --entrypoint python3 docker.getcollate.io/openmetadata/ingestion:1.13.6 --version
 ```
+(`--entrypoint` обязателен: штатный entrypoint образа подставляет `airflow` перед
+любой командой, и без него вызов превратится в `airflow python3`.)
 Дальше в примерах используется `3.12` — если у вас вывелась другая версия, замените
 `PYTHON_VERSION` в `Dockerfile` ниже на неё.
 
@@ -298,6 +297,7 @@ podman build -t localhost/etl-airflow:1.13.6 /var/storage/containers/airflow-ima
 
 ### PostgreSQL (localhost)
 ```bash
+cat > /etc/containers/systemd/postgres.container <<'EOF'
 [Unit]
 Description=PostgreSQL
 After=network-online.target
@@ -310,20 +310,21 @@ NetworkAlias=postgres
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/volumes/postgres:/var/lib/postgresql/data:Z
 Volume=/var/storage/containers/init-db.sql:/docker-entrypoint-initdb.d/init-db.sql:ro,z
+Volume=/var/storage/containers/postgres/pg_hba.conf:/etc/postgresql-custom/pg_hba.conf:ro,z
 PublishPort=127.0.0.1:5432:5432
 Network=etl.network
 HealthCmd=pg_isready -U airflow
 HealthInterval=10s
 HealthRetries=5
 PodmanArgs=--memory=4g --memory-swap=4g --cpus=2
-Exec=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=100 -c work_mem=16MB -c maintenance_work_mem=256MB
+Exec=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=100 -c work_mem=16MB -c maintenance_work_mem=256MB -c hba_file=/etc/postgresql-custom/pg_hba.conf
 
 [Service]
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > Лимиты под сервер 32 ГБ / 4-8 vCPU: `shared_buffers` ~25% лимита (1GB),
@@ -334,9 +335,43 @@ WantedBy=multi-user.target
 > `--memory-swap` явно приравнен к `--memory`, чтобы Podman не разрешил своп сверх лимита
 > по умолчанию (до 2×) — для БД своп страниц означает непредсказуемые задержки на чтении
 > вместо чистого OOM, который хотя бы виден и предсказуем.
+>
+> **`hba_file=/etc/postgresql-custom/pg_hba.conf`** — кастомный файл аутентификации,
+> создаётся в Шаге 6 (нужна подсеть `etl-network`, известная только там — тот же
+> случай, что и с `resolver` у nginx). Идея: `trust` (без пароля) — но только для
+> подключений **внутри `etl-network`**, а не `POSTGRES_HOST_AUTH_METHOD=trust`
+> (единственный вариант через штатную переменную образа), который открыл бы `trust`
+> для «любого контейнера на этом хосте» — официальная документация образа
+> прямо предупреждает именно об этом. Файл монтируется отдельно от `$PGDATA`
+> (`-c hba_file=...`, а не подмена файла внутри `/var/lib/postgresql/data`), чтобы
+> не зависеть от порядка, в котором entrypoint образа генерирует/дополняет
+> auto-сгенерированный `pg_hba.conf` при первой инициализации.
+>
+> Это **не убирает** необходимость знать пароль для подключений извне `etl-network`
+> (SSH-туннель на 5432, Шаг 7) — правило `trust` скоуплено строго по CIDR подсети,
+> для всего остального (`host all all all`) остаётся обычная `scram-sha-256`-аутентификация
+> по паролю, которую Postgres добавляет сам при первой инициализации. И это не снимает
+> риск: если когда-нибудь к `etl-network` подключат посторонний контейнер (например,
+> для отладки), он получит доступ к Postgres без пароля — тот же самый шаг, что нужен
+> и для легитимного использования сети, так что реального расширения периметра тут нет,
+> но это стоит держать в голове.
+>
+> Принцип нарочно простой: снаружи — обычный пароль, внутри `etl-network` — `trust`,
+> без дополнительных различений источника ради этого же принципа.
+>
+> **Один нюанс без практической проверки, но не требующий доработки.**
+> `PublishPort=127.0.0.1:5432:5432` — это DNAT через iptables/netavark, и неочевидно
+> заранее, каким Postgres **внутри контейнера** увидит источник SSH-туннелированного
+> подключения — реальный внешний адрес или адрес шлюза `etl-network` (`172.28.0.1`),
+> который сам подпадает под CIDR из `trust`-правила. Если второе — соединения через
+> SSH-туннель тоже пройдут без пароля. Это осознанно оставлено как есть в обоих
+> случаях — усложнять `pg_hba.conf` ради различения этого источника не стали. Если
+> захочется проверить из любопытства: подключиться через SSH-туннель (Шаг 7) и
+> посмотреть, спросит ли `psql` пароль.
 
 ### RabbitMQ (localhost)
 ```bash
+cat > /etc/containers/systemd/rabbitmq.container <<'EOF'
 [Unit]
 Description=RabbitMQ
 After=network-online.target
@@ -362,7 +397,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 Erlang VM в RabbitMQ 3.13 определяет доступную память через `/proc/meminfo` хоста, а не
@@ -381,6 +416,7 @@ EOF
 
 ### ElasticSearch (localhost)
 ```bash
+cat > /etc/containers/systemd/elasticsearch.container <<'EOF'
 [Unit]
 Description=ElasticSearch
 After=network-online.target
@@ -392,7 +428,7 @@ ContainerName=etl-elasticsearch
 NetworkAlias=elasticsearch
 Environment=discovery.type=single-node
 Environment=xpack.security.enabled=false
-Environment=ES_JAVA_OPTS=-Xms4g -Xmx4g
+Environment="ES_JAVA_OPTS=-Xms4g -Xmx4g"
 Environment=path.repo=/usr/share/elasticsearch/snapshots
 Volume=/var/storage/volumes/elasticsearch:/usr/share/elasticsearch/data:Z
 Volume=/var/storage/backups/es-snapshots:/usr/share/elasticsearch/snapshots:Z
@@ -408,9 +444,13 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
+> `Environment="ES_JAVA_OPTS=..."` — **в кавычках обязательно**: Quadlet разбирает
+> `Environment=` по правилам systemd, где пробел разделяет присваивания, и без кавычек
+> `-Xmx4g` отвалится как отдельная невалидная запись.
+>
 > `Xms` всегда равен `Xmx` — иначе JVM ресайзит кучу под нагрузкой, что даёт
 > stop-the-world паузы в моменты пиковой нагрузки. Heap — ровно половина лимита
 > контейнера (4GB из 8GB): остальное JVM использует под off-heap (Lucene-сегменты,
@@ -450,11 +490,13 @@ WantedBy=multi-user.target
 >   существуют, флаг `--proxy-headers` у `api-server` на месте;
 > - `airflow celery flower --help` (после установки `apache-airflow-providers-celery`,
 >   см. `Dockerfile` в Шаге 3) — флаги `-A/--basic-auth` и `-u/--url-prefix`
->   подтверждены, ровно то, что уже используется в `Exec=` Flower ниже.
+>   подтверждены; в юните Flower они задаются через переменные
+>   `AIRFLOW__CELERY__FLOWER_BASIC_AUTH`/`_URL_PREFIX` (см. примечание к Flower ниже).
 >
 > Дополнительной проверки перед деплоем не требуется.
 
 ```bash
+cat > /etc/containers/systemd/airflow-init.container <<'EOF'
 [Unit]
 Description=Airflow Init
 After=postgres.service rabbitmq.service
@@ -467,6 +509,7 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 Volume=/var/storage/containers/init-airflow.sh:/init-airflow.sh:ro,z
 Network=etl.network
 Entrypoint=/bin/bash
@@ -478,7 +521,7 @@ RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > `Entrypoint=/bin/bash` + `Exec=/init-airflow.sh` подменяют штатный entrypoint
@@ -497,6 +540,7 @@ WantedBy=multi-user.target
 
 ### Airflow API Server
 ```bash
+cat > /etc/containers/systemd/airflow-api-server.container <<'EOF'
 [Unit]
 Description=Airflow API Server
 After=postgres.service rabbitmq.service airflow-init.service
@@ -511,10 +555,11 @@ Environment=FORWARDED_ALLOW_IPS=*
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 PublishPort=127.0.0.1:8080:8080
 Network=etl.network
 Exec=api-server --proxy-headers
-HealthCmd=kill -0 1
+HealthCmd=curl -sf http://localhost:8080/airflow/api/v2/monitor/health
 HealthInterval=10s
 HealthRetries=6
 PodmanArgs=--memory=1g --memory-swap=1g --cpus=1
@@ -524,7 +569,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > **Переименовано из "Airflow Webserver".** В Airflow 3 `webserver` (Flask, REST API
@@ -539,21 +584,20 @@ WantedBy=multi-user.target
 > `--proxy-headers`. `*` — приемлемо для закрытого внутреннего сегмента; для более
 > строгой настройки можно указать подсеть `etl-network` вместо `*`.
 >
-> **`HealthCmd` пробует оба варианта пути** (`/airflow/...` и `/...` без префикса) —
-> потому что неочевидно заранее, действительно ли `AIRFLOW__API__BASE_URL` (Шаг 6)
-> сдвигает реальные маршруты приложения под префикс, или влияет только на генерацию
-> ссылок в интерфейсе. Официальный пример реверс-прокси для Airflow 3 показывает nginx
-> **без обрезки префикса** (`proxy_pass http://localhost:8080;` целиком, без rewrite) —
-> это косвенно говорит, что маршруты действительно перемещаются, но однозначно
-> подтвердить можно только на реальном контейнере. После первого деплоя проверьте,
-> какой из двух путей реально отвечает 200, и упростите `HealthCmd` до одного варианта:
-> ```bash
-> curl -sI http://localhost:8080/airflow/api/v2/monitor/health
-> curl -sI http://localhost:8080/api/v2/monitor/health
-> ```
+> **Все маршруты Airflow живут под `/airflow`** — это следствие
+> `AIRFLOW__API__BASE_URL=http://<IP>/airflow` (Шаг 6), проверено на живом кластере:
+> и REST API, и `/airflow/auth/token`, и маршруты плагина OpenMetadata. Поэтому
+> `HealthCmd` бьёт в `/airflow/api/v2/monitor/health`.
+>
+> **Каталог `dag_generated_configs` общий для всех Airflow-контейнеров.** Когда
+> аналитик нажимает Deploy в UI OpenMetadata, плагин в api-server пишет DAG-файл в
+> `/opt/airflow/dags`, а его конфигурацию — в `/opt/airflow/dag_generated_configs`.
+> Парсит DAG dag-processor, исполняет worker — и обоим нужен тот же конфиг. Без
+> общего volume каталог существовал бы только внутри api-server.
 
 ### Airflow Scheduler
 ```bash
+cat > /etc/containers/systemd/airflow-scheduler.container <<'EOF'
 [Unit]
 Description=Airflow Scheduler
 After=postgres.service rabbitmq.service airflow-init.service
@@ -566,9 +610,10 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 Network=etl.network
 Exec=scheduler
-HealthCmd=kill -0 1
+HealthCmd=airflow jobs check --job-type SchedulerJob --local
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=1.5g --memory-swap=1.5g --cpus=1
@@ -578,18 +623,29 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > В Airflow 3 scheduler **больше не парсит DAG-файлы сам** — только триггерит запуски
 > уже распарсенных и сериализованных в БД DAG'ов. За парсинг отвечает отдельный
 > `airflow-dag-processor` ниже — без него scheduler будет висеть «здоровым», но ни один
-> DAG не появится в интерфейсе. `AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true` в
-> `etl.env` (Шаг 6) поднимает встроенный HTTP-сервер здоровья, на котором и основан
-> `airflow jobs check` в `HealthCmd`.
+> DAG не появится в интерфейсе. `HealthCmd` использует **CLI-проверку** (`airflow jobs
+> check`) — она читает heartbeat заданий напрямую из таблицы `job` в БД, никакого HTTP
+> для этого не требуется. Подтверждено по `--help` на реальном образе:
+> `--job-type` принимает ровно `SchedulerJob`/`TriggererJob`/`DagProcessorJob`.
+> `--local` (тоже из `--help`) проверяет только задания этого хоста — вместо
+> `--hostname "$HOSTNAME"`: знак `$` в юните раскрывает уже systemd, и `$HOSTNAME`
+> из окружения юнита оказался бы пустым.
+>
+> `AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true` в `etl.env` (Шаг 6) — это **другой**,
+> независимый механизм: опциональный HTTP-сервер на порту 8974 для liveness-проб
+> в духе Kubernetes. Наш `HealthCmd` от него не зависит — переменная оставлена на
+> будущее (например, если понадобится вынести пробы во внешний мониторинг), но
+> можно спокойно убрать, если не планируете её использовать.
 
 ### Airflow Dag Processor
 ```bash
+cat > /etc/containers/systemd/airflow-dag-processor.container <<'EOF'
 [Unit]
 Description=Airflow Dag Processor
 After=postgres.service rabbitmq.service airflow-init.service
@@ -602,9 +658,10 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 Network=etl.network
 Exec=dag-processor
-HealthCmd=kill -0 1
+HealthCmd=airflow jobs check --job-type DagProcessorJob --local
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=1g --memory-swap=1g --cpus=1
@@ -614,7 +671,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > **Новый в Airflow 3, обязательный.** В Airflow 2 парсингом DAG-файлов занимался
@@ -627,6 +684,7 @@ WantedBy=multi-user.target
 
 ### Airflow Triggerer
 ```bash
+cat > /etc/containers/systemd/airflow-triggerer.container <<'EOF'
 [Unit]
 Description=Airflow Triggerer
 After=postgres.service rabbitmq.service airflow-init.service
@@ -639,29 +697,34 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 Network=etl.network
 Exec=triggerer
- HealthCmd=kill -0 1
-HealthStartPeriod=60s
-HealthInterval=15s
+HealthCmd=airflow jobs check --job-type TriggererJob --local
+HealthInterval=30s
 HealthRetries=5
-PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
+PodmanArgs=--memory=1g --memory-swap=1g --cpus=0.5
 
 [Service]
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
 > Обслуживает deferrable-операторы (асинхронное ожидание без занятого worker-слота) —
 > часть провайдеров (в т.ч. некоторые сенсоры из установленных нами пакетов) может
-> использовать этот режим по умолчанию в новых версиях. Ресурсы скромные — это
-> событийный цикл (asyncio), а не тяжёлые вычисления.
+> использовать этот режим по умолчанию в новых версиях. CPU нужно немного — это
+> событийный цикл (asyncio), а вот память — **не меньше 1 ГБ**: образ
+> `openmetadata/ingestion` тяжёлый, и триггерер уже на пустом старте занимает около
+> 500 МБ (замерено на живом кластере: пик 513 МБ). При лимите 512 МБ его убивает
+> OOM раньше, чем он успевает записать heartbeat, и в UI Airflow индикатор Triggerer
+> остаётся красным, хотя контейнер формально «healthy».
 
 ### Airflow Worker
 ```bash
+cat > /etc/containers/systemd/airflow-worker.container <<'EOF'
 [Unit]
 Description=Airflow Celery Worker
 After=postgres.service rabbitmq.service airflow-init.service
@@ -674,9 +737,10 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 Network=etl.network
 Exec=celery worker
-HealthCmd=kill -0 1
+HealthCmd=/bin/bash -c 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d celery@`hostname`'
 HealthInterval=30s
 HealthRetries=5
 PodmanArgs=--memory=3g --memory-swap=3g --cpus=3
@@ -686,6 +750,7 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
+EOF
 ```
 
 > `AIRFLOW__CELERY__WORKER_CONCURRENCY=12` задаётся в `etl.env` (Шаг 6) — задачи в
@@ -694,13 +759,14 @@ WantedBy=multi-user.target
 > В Airflow 3 worker обращается к api-server по HTTP за заданиями (Execution API), а
 > не читает БД напрямую — это требует общего `AIRFLOW__API_AUTH__JWT_SECRET` со всеми
 > остальными компонентами (Шаг 6); при рассинхроне секрета worker будет падать с
-> ошибкой авторизации, а не тихо простаивать. `HealthCmd` пробует оба пространства
-> имён celery-приложения (`airflow.providers.celery...` и старый `airflow.executors...`)
-> — так делает и официальный docker-compose Airflow 3, на случай расхождений между
-> патч-версиями провайдера Celery.
+> ошибкой авторизации, а не тихо простаивать. В `HealthCmd` имя хоста подставляется
+> через `` `hostname` ``, а не `$HOSTNAME` — чтобы в юните не было знака `$`, который
+> раскрывает systemd. Путь к celery-приложению — из провайдера
+> `apache-airflow-providers-celery` (в Airflow 3 executor живёт только там).
 
 ### Airflow Flower (за nginx, localhost)
 ```bash
+cat > /etc/containers/systemd/airflow-flower.container <<'EOF'
 [Unit]
 Description=Airflow Flower
 After=postgres.service rabbitmq.service airflow-init.service
@@ -714,10 +780,11 @@ EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
+Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
 PublishPort=127.0.0.1:5555:5555
 Network=etl.network
-Exec=celery flower --url-prefix=flower --basic-auth=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
-HealthCmd=kill -0 1
+Exec=celery flower
+HealthCmd=curl -s -o /dev/null http://localhost:5555/flower/
 HealthInterval=15s
 HealthRetries=6
 PodmanArgs=--memory=512m --memory-swap=512m --cpus=0.5
@@ -727,31 +794,20 @@ Restart=always
 
 [Install]
 WantedBy=multi-user.target
-
+EOF
 ```
 
-> **`${VAR}` прямо в `Exec=`/`HealthCmd=` — ненадёжно, экранированный `\$VAR` внутри
-> `bash -c` — надёжно.** Раньше здесь стояла подстановка вида
-> `Exec=celery flower --basic-auth=${FLOWER_ADMIN_USER}:...` в расчёте на то, что
-> systemd сам заменит `${VAR}` значениями из `EnvironmentFile=` при генерации
-> `ExecStart=`. У этого есть неочевидная зависимость от того, на каком этапе разбора
-> юнита переменные из `EnvironmentFile=` вообще становятся видны механизму
-> `$VAR`-подстановки — гарантии тут меньше, чем кажется. Надёжнее не полагаться на
-> это вообще: `Entrypoint=/bin/bash` + `Exec=-c "... \$VAR"` с экранированным `\$`
-> (чтобы systemd НЕ трогал переменную на этапе генерации) откладывает подстановку до
-> момента, когда команда реально выполняется **внутри контейнера** — там `$VAR` берёт
-> обычная shell-интерполяция bash из процессного окружения, которое `EnvironmentFile=`
-> гарантированно туда прокидывает (через `--env-file` у podman). То же самое и для
-> `HealthCmd=` — оборачиваем в `/bin/bash -c "..."` с тем же экранированием, по той же
-> причине.
+> **Логин и сабпуть Flower задаются переменными, а не флагами в `Exec=`.**
+> `airflow celery flower` берёт значения по умолчанию для `--basic-auth` и
+> `--url-prefix` из конфигурации Airflow — `AIRFLOW__CELERY__FLOWER_BASIC_AUTH` и
+> `AIRFLOW__CELERY__FLOWER_URL_PREFIX` в `etl.env` (Шаг 6). Так в юните нет ни
+> паролей, ни знаков `$`, которые systemd пытался бы раскрыть сам, и не нужно
+> подменять `Entrypoint=`: штатный entrypoint образа сам дописывает `airflow` перед
+> `Exec=celery flower`, как и у остальных компонентов.
 >
-> `--url-prefix=flower` и флаги через дефис (`--basic-auth`, не `--basic_auth`) —
-> потому что `celery flower` здесь фактически вызывается как `airflow celery flower`
-> (через `apache-airflow-providers-celery`, зашитый в `Dockerfile`, Шаг 3 — без него
-> команды `celery worker`/`celery flower` не существуют вообще, в CLI нет даже группы
-> `celery`), а не как отдельный пакет `flower` — у CLI-обёртки Airflow имена флагов
-> другие, чем в документации самого Flower. Оба флага (`-A/--basic-auth`,
-> `-u/--url-prefix`) подтверждены на реальном образе.
+> `HealthCmd` намеренно без `-f`: без логина Flower отвечает `401`, и для curl это
+> успешный ответ (процесс жив и слушает порт). Если Flower упал, curl вернёт ошибку
+> соединения, и проверка провалится. Так в health-проверке тоже не нужен пароль.
 
 ### Nginx (внешний доступ)
 ```bash
@@ -759,7 +815,7 @@ cat > /etc/containers/systemd/nginx.container <<'EOF'
 [Unit]
 Description=Nginx
 After=airflow-api-server.service openmetadata-server.service airflow-flower.service
-Requires=airflow-api-server.service openmetadata-server.service airflow-flower.service
+Wants=airflow-api-server.service openmetadata-server.service airflow-flower.service
 
 [Container]
 Image=docker.io/nginx:1.27-alpine
@@ -779,10 +835,14 @@ EOF
 
 > Единственный контейнер с портом на всех интерфейсах (`80:80` без `127.0.0.1:`) —
 > это осознанно единственная внешняя точка входа: к Airflow (`/airflow/`),
-> OpenMetadata (`/openmetadata/`) и Flower (`/flower/`), см. Шаг 4. `Requires=`
-> теперь на все три сервиса — раньше OpenMetadata и Flower стартовали независимо от
-> nginx (у обоих были свои прямые порты), теперь они обязательны, иначе
-> соответствующий путь будет отдавать 502. TLS/443 в этом рецепте не настраивается.
+> OpenMetadata (`/openmetadata/`) и Flower (`/flower/`), см. Шаг 4.
+>
+> `Wants=`, а не `Requires=`: при `Requires=` падение любого одного сервиса
+> (например, Flower) останавливает и nginx — и вместе с ним пропадают все три
+> интерфейса. С `Wants=` nginx продолжает работать, а недоступный путь просто
+> отдаёт 502. Параметр `resolve` в `upstream` (Шаг 4) позволяет nginx стартовать,
+> даже если какой-то бэкенд в этот момент ещё не резолвится. TLS/443 в этом
+> рецепте не настраивается.
 
 ### OpenMetadata Migrate (Oneshot)
 ```bash
@@ -814,6 +874,19 @@ EOF
 > `OPENMETADATA_HEAP_OPTS`. Всё совпадает с тем, что уже прописано здесь и в
 > контейнере ниже — дополнительной проверки перед деплоем не требуется.
 
+### Сабпуть OpenMetadata — через `BASE_PATH`, без своего `openmetadata.yaml`
+
+> OpenMetadata работает под `/openmetadata/` за счёт одной переменной
+> `BASE_PATH=/openmetadata/` в `etl.env` (Шаг 6): штатный `openmetadata.yaml` образа
+> сам подставляет её в пути UI, API и статики. Это подтверждено живым кластером —
+> интерфейс и API отвечают на `/openmetadata/...`, а правки переменных окружения
+> (`PIPELINE_SERVICE_CLIENT_ENDPOINT` и др.) подхватываются, значит используется
+> штатный файл образа со всеми `${...}`-подстановками.
+>
+> Свой `openmetadata.yaml` поверх штатного **не монтируем**: заменённый файл теряет
+> все остальные `${...}`-подстановки (pipeline-клиент, JWT, поиск), а точечный патч
+> путей через `sed` рискует дать двойной префикс вида `/openmetadata/openmetadata/api`.
+
 ### OpenMetadata Server (за nginx, localhost)
 ```bash
 cat > /etc/containers/systemd/openmetadata-server.container <<'EOF'
@@ -827,7 +900,7 @@ Image=docker.getcollate.io/openmetadata/server:1.13.6
 ContainerName=etl-om-server
 NetworkAlias=openmetadata-server
 EnvironmentFile=/var/storage/containers/etl.env
-Environment=OPENMETADATA_HEAP_OPTS=-Xms1g -Xmx1g
+Environment="OPENMETADATA_HEAP_OPTS=-Xms1g -Xmx1g"
 PublishPort=127.0.0.1:8585:8585
 Network=etl.network
 HealthCmd=wget -qO- http://localhost:8585/openmetadata/api/v1/system/version > /dev/null
@@ -845,35 +918,28 @@ EOF
 
 > Пайплайны ingestion (metadata-сканирование источников) теперь выполняются как обычные
 > DAG'и на этом же Celery-кластере — `PIPELINE_SERVICE_CLIENT_ENABLED=true` +
-> `AIRFLOW_HOST` в `etl.env` (Шаг 6) регистрируют его как Pipeline Service «Airflow»
+> `PIPELINE_SERVICE_CLIENT_ENDPOINT` в `etl.env` (Шаг 6) регистрируют его как Pipeline Service «Airflow»
 > в OpenMetadata. Отдельный контейнер `openmetadata-ingestion` с собственным встроенным
 > Airflow не нужен — именно это и означает формулировку документа «Airflow входит
 > в состав OpenMetadata и не требует отдельной установки».
 >
-> **Порт ушёл на localhost, доступ — через nginx на `/openmetadata/`** (Шаг 4), для
-> этого сам OpenMetadata сконфигурирован через `BASE_PATH=/openmetadata` в `etl.env`.
-> Официально задокументированный механизм у OpenMetadata (переменная `BASE_PATH`
-> переносит разом UI, `/api/v1/...` и статику под префикс) — но точный итоговый путь
-> API стоит свериться на реальном контейнере перед тем, как полагаться на него в
-> healthcheck выше и в `AIRFLOW_HOST` ниже:
-> ```bash
-> wget -qO- http://localhost:8585/openmetadata/api/v1/system/version
-> ```
-> Если путь соберётся иначе — поправьте `HealthCmd` здесь и адрес в `wget` внутри
-> `wait_healthy` (Шаг 6).
+> **Порт ушёл на localhost, доступ — через nginx на `/openmetadata/`** (Шаг 4);
+> сабпуть задаёт `BASE_PATH=/openmetadata/` в `etl.env`. API — по адресу
+> `/openmetadata/api/v1/...` (подтверждено на живом кластере), на нём построены
+> `HealthCmd` выше и `SERVER_HOST_API_URL` в Шаге 6.
 >
-> **`AIRFLOW_HOST` — не тот URL, что раньше.** До Airflow 3 OpenMetadata просто ходил
-> на `http://airflow-webserver:8080` (REST API v1). Теперь: (1) сервис называется
-> `airflow-api-server`, (2) API — v2, (3) неизвестно заранее, требует ли реальный
-> маршрут префикс `/airflow` (см. примечание к `Airflow API Server` в Шаге 3 — тот же
-> вопрос, что и с `HealthCmd`). Проверьте после деплоя, какой из вариантов отвечает,
-> и пропишите рабочий в `AIRFLOW_HOST` — командой `wget`, а не `curl`: `curl` в образе
-> `openmetadata/server` может отсутствовать (в отличие от `openmetadata/ingestion`, где
-> он подтверждён), поэтому запускать эти проверки нужно через `wget` внутри контейнера:
+> **`PIPELINE_SERVICE_CLIENT_ENDPOINT` — с префиксом `/airflow`.** Именно через него
+> OpenMetadata разворачивает и запускает ingestion-пайплайны, созданные аналитиком
+> в UI (Test Connection, Deploy, Trigger AutoPilot). Плагин `openmetadata-managed-apis`
+> в Airflow 3 регистрирует свои маршруты как Flask Blueprint — поэтому в
+> `/airflow/openapi.json` их не видно, это нормально, — и они живут под тем же
+> префиксом, что и всё приложение: `/airflow/pluginsv2/api/v2/openmetadata/...`.
+> Проверка после деплоя (через `wget`: `curl` в образе `openmetadata/server` нет):
 > ```bash
-> podman exec etl-om-server wget -qO- http://airflow-api-server:8080/airflow/api/v2/monitor/health
-> podman exec etl-om-server wget -qO- http://airflow-api-server:8080/api/v2/monitor/health
+> podman exec etl-om-server wget -S -qO- http://airflow-api-server:8080/airflow/pluginsv2/api/v2/openmetadata/health
 > ```
+> Ожидается `200` и `{"status":"healthy","version":"1.13.6.1"}`.
+>
 > Отдельный риск — сама интеграция: OM 1.13.6 официально поддерживает триггер
 > ingestion-пайплайнов через Airflow 3.x (в changelog 1.13.5 есть фикс именно для
 > этого сценария — "Deploying an ingestion pipeline intermittently returned a 500 or
@@ -892,24 +958,36 @@ EOF
 Basic Auth (Шаг 3) независимо от nginx — это по-прежнему актуально, даже когда доступ
 идёт через один общий порт с остальными сервисами.
 
-```bash
-cat > /var/storage/containers/nginx/nginx.conf <<'EOF'
+> **Файл `nginx.conf` фактически создаётся в Шаге 6, не здесь.** Причина —
+> директива `resolver` (см. ниже) требует IP шлюза сети `etl-network`, а он
+> становится известен только после того, как `deploy.sh` подберёт подсеть
+> (Шаг 2). Здесь — только объяснение содержимого, реальный `cat > nginx.conf`
+> ищите в `deploy.sh`, сразу после блока определения `$GATEWAY`. Там же, по той
+> же причине (нужна подсеть), генерируется `pg_hba.conf` для Postgres — см.
+> примечание в разделе «PostgreSQL» (Шаг 3).
+
+```nginx
 events { worker_connections 1024; }
 
 http {
+    resolver 172.28.0.1 valid=30s ipv6=off;   # ← реальный шлюз подставляется в Шаге 6
+
     map $http_upgrade $connection_upgrade {
         default upgrade;
         ''      close;
     }
 
     upstream airflow {
-        server airflow-api-server:8080;
+        zone airflow 64k;
+        server airflow-api-server:8080 resolve;
     }
     upstream openmetadata {
-        server openmetadata-server:8585;
+        zone openmetadata 64k;
+        server openmetadata-server:8585 resolve;
     }
     upstream flower {
-        server airflow-flower:5555;
+        zone flower 64k;
+        server airflow-flower:5555 resolve;
     }
 
     server {
@@ -919,6 +997,9 @@ http {
         location = / {
             return 302 /airflow/;
         }
+        location = /airflow      { return 301 /airflow/; }
+        location = /openmetadata { return 301 /openmetadata/; }
+        location = /flower       { return 301 /flower/; }
 
         location /airflow/ {
             proxy_pass http://airflow;
@@ -931,6 +1012,7 @@ http {
             proxy_set_header Connection $connection_upgrade;
             proxy_redirect off;
             proxy_read_timeout 3600s;
+            proxy_request_buffering off;
             add_header Content-Security-Policy "frame-ancestors 'self';" always;
         }
 
@@ -940,6 +1022,7 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
         }
 
         location /flower/ {
@@ -948,24 +1031,43 @@ http {
             proxy_set_header X-Real-IP $remote_addr;
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Prefix /flower;
             proxy_http_version 1.1;
             proxy_set_header Upgrade $http_upgrade;
             proxy_set_header Connection $connection_upgrade;
         }
     }
 }
-EOF
 ```
 
-Три `location` теперь устроены **одинаково** — все три не режут префикс
-(`proxy_pass http://<upstream>;` без пути после хоста передаёт исходный URI как есть).
-Так было не всегда: до Airflow 3 у `/airflow/` был другой механизм (обрезка +
-заголовок-подсказка `X-Forwarded-Prefix`), но в Airflow 3 `AIRFLOW__API__BASE_URL`
-(Шаг 6) работает так же, как `BASE_PATH` у OpenMetadata и `--url-prefix` у Flower —
-приложение само ожидает видеть путь целиком, ничего обрезать не нужно. Это подтверждено
+Три `location` не режут префикс (`proxy_pass http://<upstream>;` без пути после хоста
+передаёт исходный URI как есть) — приложение само ожидает видеть путь целиком:
+`AIRFLOW__API__BASE_URL` у Airflow, `BASE_PATH` у OpenMetadata, `--url-prefix` у
+Flower (Шаг 3/6) регистрируют маршруты сразу под этим путём. Это подтверждено
 официальным примером nginx-конфига в документации Airflow 3.3.1 для реверс-прокси.
 
 Что появилось нового по сравнению с предыдущей версией конфига:
+- **`resolver ... valid=30s` + `resolve` у каждого `server` внутри `upstream {}`.**
+  Без этого nginx резолвит имя контейнера (`airflow-api-server`, и т.д.) **один раз**
+  при старте/reload и кеширует IP навсегда — если контейнер перезапустится и получит
+  новый IP (а Podman на custom-сети это не гарантирует сохранять), nginx продолжит
+  стучаться в мёртвый адрес до собственного рестарта. Важный нюанс: одного
+  `resolver` недостаточно — при статическом хосте в `proxy_pass` (без `resolve`)
+  директива `resolver` попросту не используется, это самая частая ошибка в такой
+  настройке. Параметр `resolve` у `server` внутри `upstream` — official open-source
+  способ получить динамическое переразрешение с nginx 1.27.3+ (наш `nginx:1.27-alpine`
+  этому требованию удовлетворяет), без него пришлось бы городить `proxy_pass` через
+  `set $var` в каждом location. **`zone <имя> 64k;` в каждом `upstream` обязателен**:
+  `resolve` работает только для групп в разделяемой памяти, без `zone` nginx не
+  проходит проверку конфига («requires upstream to be in shared memory») и не стартует.
+- **Редиректы `location = /airflow`/`/openmetadata`/`/flower` без слэша на конце.**
+  Без них переход по ссылке без завершающего слэша не матчится ни на один из
+  `location /airflow/ {...}` блоков (префиксное совпадение в nginx требует точного
+  совпадения префикса) и падает в 404 вместо ожидаемого редиректа.
+- **`proxy_request_buffering off`** у `/airflow/` — не буферизует тело запроса
+  целиком во временный файл перед тем, как переслать дальше; заметно для
+  REST API с крупными телами запросов.
 - **`map $http_upgrade $connection_upgrade`** — вместо буквального `Connection "upgrade"`
   на каждый запрос. Буквальное значение ломает обычные (не-WebSocket) запросы в редких
   edge-case'ах прокси; `map`-конструкция — рекомендация из официальной документации
@@ -978,6 +1080,9 @@ EOF
 - **`$http_host` вместо `$host`** в `/airflow/` — сохраняет порт в заголовке `Host`,
   если Airflow сравнивает его с `AIRFLOW__API__BASE_URL` при валидации запроса
   (в части версий Airflow строгая проверка `Host` включена по умолчанию за прокси).
+- **`X-Forwarded-Host`/`X-Forwarded-Prefix`** у `/flower/` — часть Flower-сборок
+  использует именно эти заголовки (а не `Host`/угадывание по `proxy_pass`) для
+  построения абсолютных ссылок в интерфейсе под сабпутом.
 
 
 
@@ -1017,7 +1122,10 @@ chown -R 1000:1000 /var/storage/backups/es-snapshots
 ```bash
 cat > /var/storage/containers/etl-backup.sh <<'EOF'
 #!/bin/bash
-set -e
+set -eo pipefail
+# pipefail: без него при падении pg_dumpall конвейер вернул бы код gzip (успех),
+# и на диске тихо остался бы пустой дамп
+umask 077   # дампы содержат данные и хэши паролей — только для root
 BACKUP_DIR=/var/storage/backups
 SECRETS=/var/storage/containers/secrets.env
 TIMESTAMP=$(date +%F)
@@ -1069,7 +1177,11 @@ tar czf "$BACKUP_DIR/config-${TIMESTAMP}.tar.gz" \
     /var/storage/containers/etl.env \
     /var/storage/containers/secrets.env \
     /var/storage/containers/init-db.sql \
+    /var/storage/containers/init-airflow.sh \
     /var/storage/containers/nginx/nginx.conf \
+    /var/storage/containers/postgres/pg_hba.conf \
+    /var/storage/containers/rabbitmq/rabbitmq.conf \
+    /var/storage/containers/airflow-image/Dockerfile \
     /var/storage/containers/deploy.sh \
     /var/storage/containers/etl-backup.sh \
     /etc/containers/systemd/*.container \
@@ -1157,6 +1269,7 @@ curl -s http://localhost:9200/_snapshot/etl_backup_repo/_all | grep -o '"snapsho
 > скрипта.
 
 ```bash
+cat > /var/storage/containers/deploy.sh <<'DEPLOY'
 #!/bin/bash
 set -e
 
@@ -1165,7 +1278,12 @@ CONTAINERS_DIR="$STORAGE/containers"
 SECRETS="$CONTAINERS_DIR/secrets.env"
 ENV="$CONTAINERS_DIR/etl.env"
 NETWORK_FILE="/etc/containers/systemd/etl.network"
-IP=$(hostname -I | awk '{print $1}')
+# grep -v исключает 172.28-31.x.x — это наш же диапазон etl-network (см. ниже).
+# Без исключения при повторном запуске deploy.sh (когда сеть уже поднята и у её
+# bridge-интерфейса уже есть IP вроде 172.28.0.1) hostname -I может отдать этот
+# адрес первым, и AIRFLOW__API__BASE_URL/итоговые URL уедут на несуществующий хост.
+# 10.88.x.x — дефолтная сеть podman (интерфейс podman0), по той же причине.
+IP=$(hostname -I | tr ' ' '\n' | grep -vE '^172\.(2[89]|3[01])\.|^10\.88\.' | head -1)
 
 # ── Проверка: кастомный образ Airflow должен быть уже собран (Шаг 3) ──
 if ! podman image exists localhost/etl-airflow:1.13.6; then
@@ -1221,8 +1339,108 @@ Subnet=${SUBNET}
 Gateway=${GATEWAY}
 EOF
 else
-    echo "[0/8] $NETWORK_FILE уже существует — подсеть не пересчитываю (сеть уже используется контейнерами)"
+    GATEWAY=$(grep -oP '(?<=^Gateway=).*' "$NETWORK_FILE")
+    SUBNET=$(grep -oP '(?<=^Subnet=).*' "$NETWORK_FILE")
+    echo "[0/8] $NETWORK_FILE уже существует — подсеть не пересчитываю (сеть уже используется контейнерами), шлюз $GATEWAY"
 fi
+
+# ── nginx.conf — создаётся здесь, а не отдельным шагом, потому что resolver
+#    требует уже известный $GATEWAY (см. пояснение в Шаге 4) ───────────────
+cat > /var/storage/containers/nginx/nginx.conf <<'EOF'
+events { worker_connections 1024; }
+
+http {
+    resolver __GATEWAY__ valid=30s ipv6=off;
+
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ''      close;
+    }
+
+    upstream airflow {
+        zone airflow 64k;
+        server airflow-api-server:8080 resolve;
+    }
+    upstream openmetadata {
+        zone openmetadata 64k;
+        server openmetadata-server:8585 resolve;
+    }
+    upstream flower {
+        zone flower 64k;
+        server airflow-flower:5555 resolve;
+    }
+
+    server {
+        listen 80;
+        server_name _;
+
+        location = / {
+            return 302 /airflow/;
+        }
+        location = /airflow      { return 301 /airflow/; }
+        location = /openmetadata { return 301 /openmetadata/; }
+        location = /flower       { return 301 /flower/; }
+
+        location /airflow/ {
+            proxy_pass http://airflow;
+            proxy_set_header Host $http_host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+            proxy_redirect off;
+            proxy_read_timeout 3600s;
+            proxy_request_buffering off;
+            add_header Content-Security-Policy "frame-ancestors 'self';" always;
+        }
+
+        location /openmetadata/ {
+            proxy_pass http://openmetadata;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_http_version 1.1;
+        }
+
+        location /flower/ {
+            proxy_pass http://flower;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $host;
+            proxy_set_header X-Forwarded-Prefix /flower;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+        }
+    }
+}
+EOF
+sed -i "s/__GATEWAY__/${GATEWAY}/" /var/storage/containers/nginx/nginx.conf
+
+# ── pg_hba.conf — trust только для подключений внутри etl-network,
+#    пароль для всего остального (тот же принцип, что и у resolver выше:
+#    нужен $SUBNET, известный только после определения сети) ────────────
+mkdir -p /var/storage/containers/postgres
+cat > /var/storage/containers/postgres/pg_hba.conf <<EOF
+# Локальные подключения (Unix-сокет внутри контейнера) — всегда без пароля,
+# это поведение самого образа postgres, независимо от строк ниже
+local   all             all                                     trust
+
+# etl-network — без пароля, но строго в границах этой подсети
+host    all             all             ${SUBNET}               trust
+
+# Всё остальное (SSH-туннель на 5432 снаружи, Шаг 7, и вообще любой
+# другой источник) — обычная аутентификация по паролю
+host    all             all             all                     scram-sha-256
+EOF
+# Владелец — uid 999 (postgres в контейнере): процесс Postgres должен прочитать файл
+chown 999:999 /var/storage/containers/postgres/pg_hba.conf
+chmod 600 /var/storage/containers/postgres/pg_hba.conf
 
 # ── 1. Генераторы (чистый bash) ─────────────────────────
 pw() {
@@ -1253,18 +1471,18 @@ fernet_key() {
 }
 
 # ── 2. Секреты ────────────────────────────────────
+SECRETS_JUST_GENERATED=false
 if [ ! -f "$SECRETS" ]; then
     echo "[1/8] Генерация секретов..."
+    SECRETS_JUST_GENERATED=true
     cat > "$SECRETS" <<EOF
 POSTGRES_PASSWORD=$(pw)
 OPENMETADATA_DB_PASSWORD=$(pw)
 RABBITMQ_PASS=$(pw)
 FERNET_KEY=$(fernet_key)
-WEBSERVER_SECRET=$(hex 32)
+AIRFLOW_JWT_SECRET=$(hex 32)
 AIRFLOW_ADMIN_USER=etl_admin
 AIRFLOW_ADMIN_PASS=$(pw)
-OM_ADMIN_USER=om_admin
-OM_ADMIN_PASS=$(pw)
 FLOWER_ADMIN_USER=flower_admin
 FLOWER_ADMIN_PASS=$(pw)
 JWT_KEY_ID=$(hex 16)
@@ -1276,6 +1494,28 @@ else
 fi
 source "$SECRETS"
 
+# ── Детект рассинхрона: секреты только что сгенерированы заново, а volume'ы
+#    БД/брокера уже были проинициализированы раньше (secrets.env потерян,
+#    данные — нет). POSTGRES_PASSWORD/RABBITMQ_DEFAULT_PASS/init-db.sql
+#    применяются образами ТОЛЬКО при первой инициализации пустого volume —
+#    на существующих данных они молча игнорируются, и реальные пароли внутри
+#    остаются от предыдущего набора секретов, а не от только что созданного.
+POSTGRES_NEEDS_PASSWORD_SYNC=false
+RABBITMQ_NEEDS_PASSWORD_SYNC=false
+if [ "$SECRETS_JUST_GENERATED" = true ]; then
+    if [ -f /var/storage/volumes/postgres/PG_VERSION ]; then
+        POSTGRES_NEEDS_PASSWORD_SYNC=true
+        echo "   ⚠ secrets.env создан заново, но /var/storage/volumes/postgres уже"
+        echo "     содержит инициализированную БД — пароли Postgres актуализирую"
+        echo "     автоматически после старта (см. ниже)."
+    fi
+    if [ -n "$(ls -A /var/storage/volumes/rabbitmq 2>/dev/null)" ]; then
+        RABBITMQ_NEEDS_PASSWORD_SYNC=true
+        echo "   ⚠ secrets.env создан заново, но /var/storage/volumes/rabbitmq уже"
+        echo "     не пуст — пароль RabbitMQ актуализирую автоматически после старта."
+    fi
+fi
+
 # ── 3. init-db.sql ────────────────────────────
 echo "[2/8] Подготовка init-db.sql..."
 cat > "$CONTAINERS_DIR/init-db.sql" <<EOF
@@ -1283,6 +1523,8 @@ CREATE USER openmetadata_user WITH PASSWORD '${OPENMETADATA_DB_PASSWORD}';
 CREATE DATABASE openmetadata_db OWNER openmetadata_user;
 GRANT ALL PRIVILEGES ON DATABASE openmetadata_db TO openmetadata_user;
 EOF
+# init-скрипты entrypoint образа выполняет уже от пользователя postgres (uid 999)
+chown 999:999 "$CONTAINERS_DIR/init-db.sql"
 chmod 600 "$CONTAINERS_DIR/init-db.sql"
 
 # ── 4. init-airflow.sh ────────────────────────────
@@ -1324,10 +1566,11 @@ AIRFLOW__API__BASE_URL=http://${IP}/airflow
 AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true
 AIRFLOW_ADMIN_USER=${AIRFLOW_ADMIN_USER}
 AIRFLOW_ADMIN_PASS=${AIRFLOW_ADMIN_PASS}
-FLOWER_ADMIN_USER=${FLOWER_ADMIN_USER}
-FLOWER_ADMIN_PASS=${FLOWER_ADMIN_PASS}
+AIRFLOW__CELERY__FLOWER_BASIC_AUTH=${FLOWER_ADMIN_USER}:${FLOWER_ADMIN_PASS}
+AIRFLOW__CELERY__FLOWER_URL_PREFIX=flower
 OPENMETADATA_CLUSTER_NAME=openmetadata
-BASE_PATH=/openmetadata
+FERNET_KEY=${FERNET_KEY}
+BASE_PATH=/openmetadata/
 DB_DRIVER_CLASS=org.postgresql.Driver
 DB_SCHEME=postgresql
 DB_HOST=postgres
@@ -1340,7 +1583,8 @@ ELASTICSEARCH_HOST=elasticsearch
 ELASTICSEARCH_PORT=9200
 ELASTICSEARCH_SCHEME=http
 PIPELINE_SERVICE_CLIENT_ENABLED=true
-AIRFLOW_HOST=http://airflow-api-server:8080
+PIPELINE_SERVICE_CLIENT_ENDPOINT=http://airflow-api-server:8080/airflow
+SERVER_HOST_API_URL=http://openmetadata-server:8585/openmetadata/api
 AIRFLOW_USERNAME=${AIRFLOW_ADMIN_USER}
 AIRFLOW_PASSWORD=${AIRFLOW_ADMIN_PASS}
 AUTHENTICATION_PROVIDER=basic
@@ -1363,12 +1607,38 @@ chmod 600 "$ENV"
 #    EnvironmentFile=. Если когда-нибудь разнесёте компоненты на разные
 #    etl.env — не забудьте синхронизировать именно эту переменную, иначе
 #    получите "Invalid auth token" при обращении worker'ов к api-server.
-# 3. AIRFLOW_HOST для OpenMetadata указан БЕЗ префикса /airflow — согласно
-#    официальным примерам конфигурации Airflow 3 Execution API (внутренний,
-#    не проходит через nginx). Если после деплоя оба curl из примечания в
-#    Шаге 3 («AIRFLOW_HOST — не тот URL, что раньше») покажут, что рабочий
-#    вариант — с префиксом, поменяйте эту строку на
-#    http://airflow-api-server:8080/airflow.
+# 3. PIPELINE_SERVICE_CLIENT_ENDPOINT — ОБЯЗАТЕЛЬНО с префиксом /airflow.
+#    AIRFLOW__API__BASE_URL монтирует всё приложение Airflow (включая
+#    Flask-маршруты плагина openmetadata-managed-apis) под /airflow. Без
+#    префикса OpenMetadata стучится в /pluginsv2/api/v2/... и получает 404,
+#    в UI это выглядит как «Ingestion Scheduler is unable to respond» /
+#    «Platform Service Client Unavailable». Проверено на живом кластере:
+#    /airflow/pluginsv2/api/v2/openmetadata/health → 200.
+#    Имя переменной — именно PIPELINE_SERVICE_CLIENT_ENDPOINT (ключ apiEndpoint
+#    в openmetadata.yaml образа), не AIRFLOW_HOST.
+# 3a. SERVER_HOST_API_URL — обратный адрес, по которому плагин в Airflow
+#    сообщает результаты (Test Connection, ingestion) серверу OpenMetadata.
+#    Ключ metadataApiEndpoint в openmetadata.yaml, дефолт — localhost:8585/api,
+#    который из контейнера Airflow недоступен (Connection refused → в UI
+#    «airflow API returned Internal Server Error»). Внутренний адрес, мимо
+#    nginx, с сабпутом /openmetadata (его задаёт BASE_PATH ниже).
+# 4. DB_PARAMS=sslmode=disable — параметр pgjdbc (наш Postgres без TLS внутри
+#    закрытой сети). Раньше здесь стояли allowPublicKeyRetrieval/useSSL/
+#    serverTimezone — это параметры MySQL Connector/J, для PostgreSQL
+#    бессмысленные и потенциально просто игнорируемые драйвером. `sslmode`
+#    (не `ssl`) — потому что «disable» валидное значение именно для sslmode;
+#    у голого параметра `ssl` допустимы только true/false.
+# 5a. FERNET_KEY — ключ, которым OpenMetadata шифрует пароли подключений к
+#    СУБД, введённые аналитиками в UI. Без переменной используется дефолтный
+#    ключ из openmetadata.yaml образа — он публично известен. ВНИМАНИЕ: на уже
+#    работающем инстансе ключ не менять — сохранённые пароли подключений
+#    перестанут расшифровываться. Только для нового деплоя.
+# 5b. AIRFLOW__CELERY__FLOWER_BASIC_AUTH / _URL_PREFIX — логин и сабпуть Flower
+#    (см. примечание к юниту Flower в Шаге 3).
+# 5. BASE_PATH=/openmetadata/ — обязательно с завершающим слэшем. Без него
+#    OpenMetadata на части сборок собирает свои внутренние пути (UI/статика)
+#    некорректно — визуально это похоже на «съеденную» букву в пути или
+#    склеенные без разделителя сегменты URL.
 
 # ── 6. Helper для ожидания healthcheck ────────
 wait_healthy() {
@@ -1386,21 +1656,63 @@ wait_healthy() {
     exit 1
 }
 
+# ── 7. Предзагрузка образов ──────────────────────────
+# systemd даёт сервису 90 секунд на старт; образы ES и OpenMetadata при первом
+# pull тянутся дольше, и сервис упал бы по таймауту. Качаем заранее.
+echo "[5/8] Загрузка образов..."
+for img in docker.io/postgres:17 docker.io/rabbitmq:3.13-management \
+           docker.elastic.co/elasticsearch/elasticsearch:9.3.0 \
+           docker.io/nginx:1.27-alpine \
+           docker.getcollate.io/openmetadata/server:1.13.6; do
+    podman image exists "$img" || podman pull "$img"
+done
+
 # ── 8. Запуск ────────────────────────────────────────
-echo "[5/8] Запуск сервисов..."
+echo "[6/8] Запуск сервисов..."
 systemctl daemon-reload
 
 systemctl start postgres rabbitmq elasticsearch
 wait_healthy etl-postgres
+
+if [ "$POSTGRES_NEEDS_PASSWORD_SYNC" = true ]; then
+    echo "   Актуализация паролей Postgres под новые secrets.env..."
+    podman exec -i etl-postgres psql -U airflow -d airflow -c \
+        "ALTER USER airflow WITH PASSWORD '${POSTGRES_PASSWORD}';" \
+        || echo "   ⚠ Не удалось обновить пароль airflow — проверьте вручную (Управление)"
+    podman exec -i etl-postgres psql -U airflow -d airflow -c \
+        "ALTER USER openmetadata_user WITH PASSWORD '${OPENMETADATA_DB_PASSWORD}';" \
+        || echo "   ⚠ Не удалось обновить пароль openmetadata_user (роль могла не существовать) — проверьте вручную"
+fi
+
 wait_healthy etl-rabbitmq
+
+if [ "$RABBITMQ_NEEDS_PASSWORD_SYNC" = true ]; then
+    echo "   Актуализация пароля RabbitMQ под новые secrets.env..."
+    podman exec etl-rabbitmq rabbitmqctl change_password airflow "${RABBITMQ_PASS}" \
+        || echo "   ⚠ Не удалось обновить пароль RabbitMQ — проверьте вручную (Управление)"
+fi
+
 wait_healthy etl-elasticsearch 90
+
+if [ "$POSTGRES_NEEDS_PASSWORD_SYNC" = true ]; then
+    echo ""
+    echo "   ⚠ ВАЖНО: логины Airflow (${AIRFLOW_ADMIN_USER}) и OpenMetadata"
+    echo "     (admin) создаются только при первой инициализации и на"
+    echo "     существующей БД тихо пропускаются — пароли для них в новом"
+    echo "     secrets.env НЕ актуальны, автоматически не синхронизируются."
+    echo "     Реальный логин — тот, что был при первом деплое. Если он тоже"
+    echo "     утерян — сбросить вручную после запуска (см. «Управление» в гайде)."
+    echo ""
+fi
 
 systemctl start airflow-init
 
 systemctl start airflow-api-server airflow-scheduler airflow-dag-processor airflow-triggerer airflow-worker airflow-flower
 wait_healthy etl-airflow-api-server 60
+wait_healthy etl-airflow-scheduler 60
 wait_healthy etl-airflow-dag-processor 60
 wait_healthy etl-airflow-triggerer 60
+wait_healthy etl-airflow-worker 60
 wait_healthy etl-airflow-flower 60
 
 systemctl start openmetadata-migrate
@@ -1409,12 +1721,10 @@ wait_healthy etl-om-server 90
 
 systemctl start nginx
 
-echo "[6/8] Включение автозапуска..."
-systemctl enable postgres rabbitmq elasticsearch \
-    airflow-init airflow-api-server airflow-scheduler \
-    airflow-dag-processor airflow-triggerer airflow-worker airflow-flower \
-    openmetadata-migrate openmetadata-server nginx
-
+# Автозапуск Quadlet-юнитов задаётся их секцией [Install] (WantedBy=multi-user.target):
+# генератор Quadlet применяет её сам при daemon-reload. `systemctl enable` для
+# сгенерированных юнитов не работает и под `set -e` оборвал бы скрипт.
+# Обычный systemd-таймер бэкапов включается как обычно:
 echo "[7/8] Включение таймера бэкапов..."
 systemctl enable --now etl-backup.timer
 
@@ -1427,7 +1737,7 @@ echo " Airflow UI    http://${IP}/airflow"
 echo "   ${AIRFLOW_ADMIN_USER} / ${AIRFLOW_ADMIN_PASS}"
 echo ""
 echo " OpenMetadata  http://${IP}/openmetadata"
-echo "   ${OM_ADMIN_USER} / ${OM_ADMIN_PASS}"
+echo "   admin@open-metadata.org / admin — встроенный админ, СМЕНИТЕ пароль при первом входе"
 echo ""
 echo " Flower        http://${IP}/flower"
 echo "   ${FLOWER_ADMIN_USER} / ${FLOWER_ADMIN_PASS}"
@@ -1443,7 +1753,9 @@ echo " Бэкапы: /var/storage/backups (ежедневно 03:00, тайме�
 echo "   Postgres + ElasticSearch-снапшоты + RabbitMQ-определения + конфигурация)"
 echo " Секреты: $SECRETS"
 echo "============================================"
+DEPLOY
 
+chmod +x /var/storage/containers/deploy.sh
 ```
 
 ---
@@ -1457,6 +1769,9 @@ echo "============================================"
 
 **Проверка:**
 ```bash
+# Конфиг nginx валиден (resolve/zone — функции nginx 1.27.3+, проверяем в самом контейнере)
+podman exec etl-nginx nginx -t
+
 # Внешний порт — теперь только один
 ss -tlnp | grep ':80 '
 # Ожидается: 0.0.0.0:80
@@ -1481,6 +1796,15 @@ podman ps --format "table {{.Names}}\t{{.Status}}"
 # Таймер бэкапов
 systemctl list-timers etl-backup.timer
 
+# OpenMetadata видит плагин managed-apis в Airflow (без этого Test Connection
+# и Deploy пайплайнов из UI не работают)
+podman exec etl-om-server wget -qO- http://airflow-api-server:8080/airflow/pluginsv2/api/v2/openmetadata/health
+# Ожидается: {"status":"healthy","version":"1.13.6.1"}
+
+# Обратная связь: плагин в Airflow достучится до OpenMetadata по SERVER_HOST_API_URL
+podman exec etl-airflow-api-server curl -s http://openmetadata-server:8585/openmetadata/api/v1/system/version
+# Ожидается JSON с версией 1.13.6
+
 # Провайдеры реально установились (не молча пропущены)
 podman exec etl-airflow-worker airflow providers list
 ```
@@ -1496,16 +1820,19 @@ podman exec etl-airflow-worker airflow providers list
 │   ├── etl-backup.sh
 │   ├── secrets.env              ← chmod 600
 │   ├── etl.env                  ← chmod 600
-│   ├── init-db.sql              ← chmod 600
+│   ├── init-db.sql              ← владелец 999, chmod 600
 │   ├── init-airflow.sh
 │   ├── airflow-image/
 │   │   └── Dockerfile           ← FROM openmetadata/ingestion, провайдеры
 │   ├── airflow/
 │   │   ├── dags/
+│   │   ├── dag_generated_configs/   ← конфиги пайплайнов, которые деплоит OpenMetadata
 │   │   ├── logs/
 │   │   └── plugins/
 │   ├── rabbitmq/
 │   │   └── rabbitmq.conf
+│   ├── postgres/
+│   │   └── pg_hba.conf           ← владелец 999, chmod 600, trust только для etl-network
 │   └── nginx/
 │       └── nginx.conf
 ├── volumes/
@@ -1580,3 +1907,46 @@ systemctl stop openmetadata-server nginx \
 
 # После reboot всё запустится автоматически (включая таймер бэкапов)
 ```
+
+### Если пароли Postgres/RabbitMQ разошлись с `secrets.env`
+
+`deploy.sh` синхронизирует их автоматически, только когда сам обнаруживает
+рассинхрон (секреты только что созданы заново, а volume уже был проинициализирован
+раньше). Если нужно сделать это вручную — например, синхронизация не сработала,
+или volume RabbitMQ пуст не был, но пароль всё равно не совпадает:
+
+```bash
+source /var/storage/containers/secrets.env
+
+# Postgres — через локальный сокет (trust, пароль не нужен, см. Шаг 3)
+podman exec -it etl-postgres psql -U airflow -d airflow -c \
+    "ALTER USER airflow WITH PASSWORD '${POSTGRES_PASSWORD}';"
+podman exec -it etl-postgres psql -U airflow -d airflow -c \
+    "ALTER USER openmetadata_user WITH PASSWORD '${OPENMETADATA_DB_PASSWORD}';"
+
+# RabbitMQ — rabbitmqctl работает через cookie кластера, старый пароль не нужен
+podman exec etl-rabbitmq rabbitmqctl change_password airflow "${RABBITMQ_PASS}"
+
+# После смены — перезапустить всё, что держит соединение с этими паролями
+systemctl restart airflow-init airflow-api-server airflow-scheduler \
+    airflow-dag-processor airflow-triggerer airflow-worker airflow-flower \
+    openmetadata-server
+```
+
+### Если логин Airflow/OpenMetadata (не пароль в БД, а сам вход) не совпадает
+
+Это другой случай — `airflow users create`/создание админа OpenMetadata выполняются
+только при самой первой инициализации и на существующих данных тихо пропускаются,
+поэтому `deploy.sh` их не трогает вообще, даже при обнаруженном рассинхроне БД.
+Если реальный логин неизвестен (старый `secrets.env` утерян вместе с паролем):
+
+- **Airflow** — команда для сброса пароля существующего пользователя зависит от
+  версии CLI FAB-провайдера; проверьте `podman exec etl-airflow-api-server airflow
+  users --help` на предмет подходящей подкоманды (`reset-password` в части версий)
+  перед тем как полагаться на конкретное имя — в этом гайде оно не проверялось.
+- **OpenMetadata** — встроенный админ при basic-аутентификации:
+  `admin@open-metadata.org` / `admin` (сменить при первом входе). Остальных
+  пользователей — через UI (`Settings → Users`), если есть доступ под каким-то
+  админским логином; если нет ни одного рабочего — потребуется прямое вмешательство
+  в БД `openmetadata_db` (таблица пользователей), что уже не входит в этот гайд.
+

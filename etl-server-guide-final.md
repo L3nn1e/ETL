@@ -152,6 +152,7 @@ OpenMetadata: 1.13.0 бандлит Airflow 3.2.1, начиная с 1.13.5 (и 
 - Шаг 5 — бэкапы (Postgres, ElasticSearch, RabbitMQ, конфигурация)
 - Шаг 6 — скрипт развёртывания deploy.sh
 - Шаг 7 — запуск и проверка
+- Мониторинг в Zabbix — PostgreSQL (плагин агента 2) и контейнеры Podman (Docker-плагин через сокет Podman)
 - Итоговая структура файлов
 - Управление
 
@@ -176,7 +177,7 @@ sysctl -p /etc/sysctl.d/99-elasticsearch.conf
 
 # Каталоги
 mkdir -p /var/storage/volumes/{postgres,rabbitmq,elasticsearch}
-mkdir -p /var/storage/containers/{airflow/{dags,logs,plugins,dag_generated_configs},nginx}
+mkdir -p /var/storage/containers/{airflow/{dags,etl-dags,logs,plugins,dag_generated_configs},nginx}
 mkdir -p /var/storage/backups
 mkdir -p /etc/containers/systemd
 
@@ -317,7 +318,7 @@ HealthCmd=pg_isready -U airflow
 HealthInterval=10s
 HealthRetries=5
 PodmanArgs=--memory=4g --memory-swap=4g --cpus=2
-Exec=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=100 -c work_mem=16MB -c maintenance_work_mem=256MB -c hba_file=/etc/postgresql-custom/pg_hba.conf
+Exec=postgres -c shared_buffers=1GB -c effective_cache_size=3GB -c max_connections=200 -c work_mem=8MB -c maintenance_work_mem=256MB -c hba_file=/etc/postgresql-custom/pg_hba.conf
 
 [Service]
 Restart=always
@@ -328,10 +329,17 @@ EOF
 ```
 
 > Лимиты под сервер 32 ГБ / 4-8 vCPU: `shared_buffers` ~25% лимита (1GB),
-> `effective_cache_size` — оценка того, сколько ОС+Postgres суммарно закешируют (3GB),
-> `max_connections=100` с запасом под Airflow-кластер + БД OpenMetadata одновременно,
-> `work_mem=16MB` — при 100 соединениях в худшем случае (несколько sort/hash-узлов на
-> запрос) это может дать несколько ГБ, отслеживайте по факту через `pg_stat_activity`.
+> `effective_cache_size` — оценка того, сколько ОС+Postgres суммарно закешируют (3GB).
+> `max_connections=200`: на живом кластере уже при нескольких ingestion-пайплайнах
+> было занято 86 из 100 — из них 66 держит пул OpenMetadata, остальное Airflow
+> (у каждого компонента свой пул, воркер с `concurrency=12`). Пул OpenMetadata по
+> умолчанию растёт до 100 соединений — поэтому в `etl.env` он явно ограничен 50
+> (`DB_CONNECTION_POOL_MAX_SIZE`, Шаг 6), иначе один OpenMetadata мог бы занять
+> весь лимит. `work_mem=8MB` —
+> снижен вдвое вместе с ростом соединений: худший случай (несколько sort/hash на
+> запрос × все соединения) должен оставаться в пределах лимита контейнера 4 ГБ.
+> Загрузку соединений отслеживайте так:
+> `podman exec etl-postgres psql -U airflow -c "SELECT datname, state, count(*) FROM pg_stat_activity GROUP BY 1,2 ORDER BY 3 DESC;"`
 > `--memory-swap` явно приравнен к `--memory`, чтобы Podman не разрешил своп сверх лимита
 > по умолчанию (до 2×) — для БД своп страниц означает непредсказуемые задержки на чтении
 > вместо чистого OOM, который хотя бы виден и предсказуем.
@@ -428,7 +436,7 @@ ContainerName=etl-elasticsearch
 NetworkAlias=elasticsearch
 Environment=discovery.type=single-node
 Environment=xpack.security.enabled=false
-Environment="ES_JAVA_OPTS=-Xms4g -Xmx4g"
+Environment="ES_JAVA_OPTS=-Xms2g -Xmx2g"
 Environment=path.repo=/usr/share/elasticsearch/snapshots
 Volume=/var/storage/volumes/elasticsearch:/usr/share/elasticsearch/data:Z
 Volume=/var/storage/backups/es-snapshots:/usr/share/elasticsearch/snapshots:Z
@@ -437,7 +445,7 @@ Network=etl.network
 HealthCmd=curl -sf http://localhost:9200/_cluster/health
 HealthInterval=15s
 HealthRetries=10
-PodmanArgs=--memory=8g --memory-swap=8g --cpus=2
+PodmanArgs=--memory=4g --memory-swap=4g --cpus=2
 
 [Service]
 Restart=always
@@ -455,6 +463,10 @@ EOF
 > stop-the-world паузы в моменты пиковой нагрузки. Heap — ровно половина лимита
 > контейнера (4GB из 8GB): остальное JVM использует под off-heap (Lucene-сегменты,
 > файловый кеш ОС).
+>
+> Heap 2 ГБ при лимите 4 ГБ — с запасом для метаданных OpenMetadata: на живом
+> кластере все индексы вместе занимают ~350 МБ. Если каталог вырастет до миллионов
+> объектов, увеличивайте оба значения вместе, сохраняя соотношение 1:2.
 
 ### Airflow Init (Oneshot)
 
@@ -507,6 +519,7 @@ Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-init
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -553,6 +566,7 @@ NetworkAlias=airflow-api-server
 EnvironmentFile=/var/storage/containers/etl.env
 Environment=FORWARDED_ALLOW_IPS=*
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -586,8 +600,12 @@ EOF
 >
 > **Все маршруты Airflow живут под `/airflow`** — это следствие
 > `AIRFLOW__API__BASE_URL=http://<IP>/airflow` (Шаг 6), проверено на живом кластере:
-> и REST API, и `/airflow/auth/token`, и маршруты плагина OpenMetadata. Поэтому
-> `HealthCmd` бьёт в `/airflow/api/v2/monitor/health`.
+> и REST API, и `/airflow/auth/token`, и Execution API для воркеров, и маршруты
+> плагина OpenMetadata. Поэтому `HealthCmd` бьёт в `/airflow/api/v2/monitor/health`,
+> и **все внутренние адреса Airflow в `etl.env`** (`EXECUTION_API_SERVER_URL`,
+> `PIPELINE_SERVICE_CLIENT_ENDPOINT`) тоже с префиксом `/airflow`. Если его
+> пропустить, health-проверки через `wget -L`/браузер могут пройти за счёт
+> редиректа и замаскировать ошибку, а реальные `POST`/`PATCH`-вызовы получат 404.
 >
 > **Каталог `dag_generated_configs` общий для всех Airflow-контейнеров.** Когда
 > аналитик нажимает Deploy в UI OpenMetadata, плагин в api-server пишет DAG-файл в
@@ -608,6 +626,7 @@ Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-scheduler
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -656,6 +675,7 @@ Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-dag-processor
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -695,6 +715,7 @@ Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-triggerer
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -735,6 +756,7 @@ Image=localhost/etl-airflow:1.13.6
 ContainerName=etl-airflow-worker
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -743,7 +765,7 @@ Exec=celery worker
 HealthCmd=/bin/bash -c 'celery --app airflow.providers.celery.executors.celery_executor.app inspect ping -d celery@`hostname`'
 HealthInterval=30s
 HealthRetries=5
-PodmanArgs=--memory=3g --memory-swap=3g --cpus=3
+PodmanArgs=--memory=8g --memory-swap=8g --cpus=3
 
 [Service]
 Restart=always
@@ -753,9 +775,17 @@ WantedBy=multi-user.target
 EOF
 ```
 
-> `AIRFLOW__CELERY__WORKER_CONCURRENCY=12` задаётся в `etl.env` (Шаг 6) — задачи в
-> основном I/O-bound (MSSQL/SFTP/Samba/HTTP), поэтому конкурентность заметно выше
-> числа ядер оправдана: воркер большую часть времени ждёт сеть/диск, а не считает.
+> **Память 8 ГБ и `AIRFLOW__CELERY__WORKER_CONCURRENCY=6`** (в `etl.env`, Шаг 6).
+> Ingestion-задачи OpenMetadata тяжёлые: каждая — отдельный Python-процесс, который
+> уже при загрузке библиотек (pandas, numexpr, коннекторы) занимает 0.5–1 ГБ и больше
+> на крупных базах. На живом кластере при лимите 3 ГБ задачи, стартовавшие
+> одновременно по одинаковому расписанию, убивал OOM («Process terminated by signal.
+> Likely out of memory error»). 8 ГБ на 6 слотов — ~1.3 ГБ на задачу; лишние задачи
+> не теряются, а ждут слота в очереди RabbitMQ. Если нужно больше параллельных
+> задач — растите память пропорционально, а не только concurrency. И разнесите
+> расписания пайплайнов в OpenMetadata (02:00, 02:30, 03:00…), чтобы не стартовали
+> разом.
+>
 > В Airflow 3 worker обращается к api-server по HTTP за заданиями (Execution API), а
 > не читает БД напрямую — это требует общего `AIRFLOW__API_AUTH__JWT_SECRET` со всеми
 > остальными компонентами (Шаг 6); при рассинхроне секрета worker будет падать с
@@ -778,6 +808,7 @@ ContainerName=etl-airflow-flower
 NetworkAlias=airflow-flower
 EnvironmentFile=/var/storage/containers/etl.env
 Volume=/var/storage/containers/airflow/dags:/opt/airflow/dags:z
+Volume=/var/storage/containers/airflow/etl-dags:/opt/airflow/etl-dags:z
 Volume=/var/storage/containers/airflow/logs:/opt/airflow/logs:z
 Volume=/var/storage/containers/airflow/plugins:/opt/airflow/plugins:z
 Volume=/var/storage/containers/airflow/dag_generated_configs:/opt/airflow/dag_generated_configs:z
@@ -900,13 +931,13 @@ Image=docker.getcollate.io/openmetadata/server:1.13.6
 ContainerName=etl-om-server
 NetworkAlias=openmetadata-server
 EnvironmentFile=/var/storage/containers/etl.env
-Environment="OPENMETADATA_HEAP_OPTS=-Xms1g -Xmx1g"
+Environment="OPENMETADATA_HEAP_OPTS=-Xms2g -Xmx2g"
 PublishPort=127.0.0.1:8585:8585
 Network=etl.network
 HealthCmd=wget -qO- http://localhost:8585/openmetadata/api/v1/system/version > /dev/null
 HealthInterval=10s
 HealthRetries=10
-PodmanArgs=--memory=2g --memory-swap=2g --cpus=1
+PodmanArgs=--memory=3g --memory-swap=3g --cpus=1
 
 [Service]
 Restart=always
@@ -915,6 +946,13 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 ```
+
+> Heap **2 ГБ** (`-Xms2g -Xmx2g`, в кавычках — см. примечание к ES) при лимите
+> контейнера 3 ГБ: остаток нужен JVM вне heap (потоки, metaspace, буферы). На
+> живом кластере с 1 ГБ сервер под нагрузкой ingestion упирался в потолок. Если
+> кавычки потерять, `-Xmx` молча отвалится и JVM сама выберет максимум — 25% от
+> лимита контейнера. Проверка: `podman inspect etl-om-server --format
+> '{{range .Config.Env}}{{println .}}{{end}}' | grep HEAP`.
 
 > Пайплайны ingestion (metadata-сканирование источников) теперь выполняются как обычные
 > DAG'и на этом же Celery-кластере — `PIPELINE_SERVICE_CLIENT_ENABLED=true` +
@@ -1023,6 +1061,8 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_http_version 1.1;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
         }
 
         location /flower/ {
@@ -1065,6 +1105,11 @@ Flower (Шаг 3/6) регистрируют маршруты сразу под 
   Без них переход по ссылке без завершающего слэша не матчится ни на один из
   `location /airflow/ {...}` блоков (префиксное совпадение в nginx требует точного
   совпадения префикса) и падает в 404 вместо ожидаемого редиректа.
+- **`proxy_read_timeout 300s`** у `/openmetadata/`. Дефолт nginx — 60 секунд, а часть
+  страниц OpenMetadata (Settings → Services → Pipelines) строится долго: сервер
+  опрашивает Airflow о статусе каждого ingestion-пайплайна. Пока Airflow занят,
+  ответ может не уложиться в минуту, и nginx отдаёт `504 Gateway Time-out`
+  (наблюдалось на живом кластере).
 - **`proxy_request_buffering off`** у `/airflow/` — не буферизует тело запроса
   целиком во временный файл перед тем, как переслать дальше; заметно для
   REST API с крупными телами запросов.
@@ -1182,6 +1227,7 @@ tar czf "$BACKUP_DIR/config-${TIMESTAMP}.tar.gz" \
     /var/storage/containers/postgres/pg_hba.conf \
     /var/storage/containers/rabbitmq/rabbitmq.conf \
     /var/storage/containers/airflow-image/Dockerfile \
+    /var/storage/containers/airflow/etl-dags \
     /var/storage/containers/deploy.sh \
     /var/storage/containers/etl-backup.sh \
     /etc/containers/systemd/*.container \
@@ -1403,6 +1449,8 @@ http {
             proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
             proxy_set_header X-Forwarded-Proto $scheme;
             proxy_http_version 1.1;
+            proxy_read_timeout 300s;
+            proxy_send_timeout 300s;
         }
 
         location /flower/ {
@@ -1522,6 +1570,9 @@ cat > "$CONTAINERS_DIR/init-db.sql" <<EOF
 CREATE USER openmetadata_user WITH PASSWORD '${OPENMETADATA_DB_PASSWORD}';
 CREATE DATABASE openmetadata_db OWNER openmetadata_user;
 GRANT ALL PRIVILEGES ON DATABASE openmetadata_db TO openmetadata_user;
+-- OpenMetadata (движок workflow Flowable) может «забыть» закрыть транзакцию;
+-- такая сессия держит соединение и блокировки. Postgres закроет её сам.
+ALTER ROLE openmetadata_user SET idle_in_transaction_session_timeout = '15min';
 EOF
 # init-скрипты entrypoint образа выполняет уже от пользователя postgres (uid 999)
 chown 999:999 "$CONTAINERS_DIR/init-db.sql"
@@ -1556,11 +1607,13 @@ AIRFLOW__CORE__AUTH_MANAGER=airflow.providers.fab.auth_manager.fab_auth_manager.
 AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://airflow:${POSTGRES_PASSWORD}@postgres:5432/airflow
 AIRFLOW__CELERY__RESULT_BACKEND=db+postgresql://airflow:${POSTGRES_PASSWORD}@postgres:5432/airflow
 AIRFLOW__CELERY__BROKER_URL=amqp://airflow:${RABBITMQ_PASS}@rabbitmq:5672/
-AIRFLOW__CELERY__WORKER_CONCURRENCY=12
+AIRFLOW__CELERY__WORKER_CONCURRENCY=6
 AIRFLOW__CORE__FERNET_KEY=${FERNET_KEY}
 AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=true
+AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST=[{"name":"dags-folder","classpath":"airflow.dag_processing.bundles.local.LocalDagBundle","kwargs":{}},{"name":"etl","classpath":"airflow.dag_processing.bundles.local.LocalDagBundle","kwargs":{"path":"/opt/airflow/etl-dags"}}]
 AIRFLOW__CORE__LOAD_EXAMPLES=false
-AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://airflow-api-server:8080/execution/
+AIRFLOW__CORE__TEST_CONNECTION=Enabled
+AIRFLOW__CORE__EXECUTION_API_SERVER_URL=http://airflow-api-server:8080/airflow/execution/
 AIRFLOW__API_AUTH__JWT_SECRET=${AIRFLOW_JWT_SECRET}
 AIRFLOW__API__BASE_URL=http://${IP}/airflow
 AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK=true
@@ -1578,6 +1631,10 @@ DB_PORT=5432
 DB_USER=openmetadata_user
 DB_USER_PASSWORD=${OPENMETADATA_DB_PASSWORD}
 DB_PARAMS=sslmode=disable
+DB_CONNECTION_POOL_MAX_SIZE=50
+DB_CONNECTION_POOL_MIN_SIZE=10
+DB_CONNECTION_POOL_MIN_IDLE=10
+DB_CONNECTION_POOL_INITIAL_SIZE=10
 SEARCH_TYPE=elasticsearch
 ELASTICSEARCH_HOST=elasticsearch
 ELASTICSEARCH_PORT=9200
@@ -1607,6 +1664,13 @@ chmod 600 "$ENV"
 #    EnvironmentFile=. Если когда-нибудь разнесёте компоненты на разные
 #    etl.env — не забудьте синхронизировать именно эту переменную, иначе
 #    получите "Invalid auth token" при обращении worker'ов к api-server.
+# 2a. AIRFLOW__CORE__EXECUTION_API_SERVER_URL — тоже ОБЯЗАТЕЛЬНО с префиксом
+#    /airflow: Execution API (через него воркер стартует и завершает задачи)
+#    смонтирован под тем же BASE_URL, что и всё приложение. Без префикса воркер
+#    получает 404 на task_instances.start, и задача падает, не выйдя из queued
+#    («finished with state failed, but the task instance's state attribute is
+#    queued»). Проверено на живом кластере: /execution/health → 404,
+#    /airflow/execution/health → 200.
 # 3. PIPELINE_SERVICE_CLIENT_ENDPOINT — ОБЯЗАТЕЛЬНО с префиксом /airflow.
 #    AIRFLOW__API__BASE_URL монтирует всё приложение Airflow (включая
 #    Flask-маршруты плагина openmetadata-managed-apis) под /airflow. Без
@@ -1628,6 +1692,19 @@ chmod 600 "$ENV"
 #    бессмысленные и потенциально просто игнорируемые драйвером. `sslmode`
 #    (не `ssl`) — потому что «disable» валидное значение именно для sslmode;
 #    у голого параметра `ssl` допустимы только true/false.
+# 2c. AIRFLOW__CORE__TEST_CONNECTION=Enabled — кнопка Test в Admin → Connections
+#     (api-server сам открывает соединение; править подключения — только админам).
+# 2b. DAG_BUNDLE_CONFIG_LIST — два источника DAG'ов (DAG bundles, Airflow 3):
+#    «dags-folder» (/opt/airflow/dags) — только DAG'и, которые генерирует
+#    OpenMetadata; «etl» (/opt/airflow/etl-dags) — собственные DAG'и компании.
+#    Имя «dags-folder» не менять: на него ссылаются задеплоенные пайплайны.
+# 4a. DB_CONNECTION_POOL_* — пул соединений OpenMetadata к Postgres. Дефолт в
+#    openmetadata.yaml образа — до 100 соединений, то есть один OpenMetadata
+#    готов занять весь max_connections Postgres. Под нагрузкой ingestion пул
+#    растёт, Postgres отказывает, Hikari ждёт соединение connectionTimeout=30s —
+#    и все запросы UI висят по 30 секунд, а потом 503 (наблюдалось на живом
+#    кластере). 50 для OpenMetadata + пулы Airflow помещаются в
+#    max_connections=200 (Шаг 3) с запасом.
 # 5a. FERNET_KEY — ключ, которым OpenMetadata шифрует пароли подключений к
 #    СУБД, введённые аналитиками в UI. Без переменной используется дефолтный
 #    ключ из openmetadata.yaml образа — он публично известен. ВНИМАНИЕ: на уже
@@ -1693,6 +1770,16 @@ if [ "$RABBITMQ_NEEDS_PASSWORD_SYNC" = true ]; then
 fi
 
 wait_healthy etl-elasticsearch 90
+
+# Одноузловой ES: репликам негде жить, без этого все индексы висят в yellow.
+# Шаблон с priority 0 применяется ко всем новым индексам (их создаёт OpenMetadata),
+# PUT на _all — к уже существующим (на случай повторного деплоя).
+curl -sf -X PUT localhost:9200/_index_template/single-node-no-replicas \
+    -H 'Content-Type: application/json' \
+    -d '{"index_patterns":["*"],"priority":0,"template":{"settings":{"number_of_replicas":0}}}' >/dev/null \
+    || echo "   ⚠ не удалось задать шаблон ES без реплик — статус будет yellow, на работу не влияет"
+curl -sf -X PUT localhost:9200/_all/_settings \
+    -H 'Content-Type: application/json' -d '{"index":{"number_of_replicas":0}}' >/dev/null || true
 
 if [ "$POSTGRES_NEEDS_PASSWORD_SYNC" = true ]; then
     echo ""
@@ -1801,6 +1888,11 @@ systemctl list-timers etl-backup.timer
 podman exec etl-om-server wget -qO- http://airflow-api-server:8080/airflow/pluginsv2/api/v2/openmetadata/health
 # Ожидается: {"status":"healthy","version":"1.13.6.1"}
 
+# Воркер видит Execution API (без этого задачи падают, не выходя из queued).
+# curl без -L — чтобы редирект не замаскировал неверный путь
+podman exec etl-airflow-worker curl -s -o /dev/null -w "%{http_code}\n" http://airflow-api-server:8080/airflow/execution/health
+# Ожидается: 200
+
 # Обратная связь: плагин в Airflow достучится до OpenMetadata по SERVER_HOST_API_URL
 podman exec etl-airflow-api-server curl -s http://openmetadata-server:8585/openmetadata/api/v1/system/version
 # Ожидается JSON с версией 1.13.6
@@ -1808,6 +1900,148 @@ podman exec etl-airflow-api-server curl -s http://openmetadata-server:8585/openm
 # Провайдеры реально установились (не молча пропущены)
 podman exec etl-airflow-worker airflow providers list
 ```
+
+---
+
+## Мониторинг в Zabbix (agent 2)
+
+Хост мониторится агентом 2 с двумя плагинами: **PostgreSQL** (отдельный пакет,
+loadable-плагин) и **Docker** (встроенный в агент). Docker-плагин работает с
+Podman через его Docker-совместимое API. Сам агент и шаблоны Linux здесь не
+описаны — только то, что специфично для этого сервера.
+
+### PostgreSQL — шаблон «PostgreSQL by Zabbix agent 2»
+
+**1. Пользователь мониторинга в базе.** Имя и пароль задаются явно (подставьте свои).
+Роли `pg_monitor` достаточно: суперпользователь не нужен, данные таблиц недоступны.
+
+```bash
+ZBX_USER='имя_пользователя'
+ZBX_PASS='пароль'
+
+podman exec -i etl-postgres psql -U airflow -d postgres -v ON_ERROR_STOP=1 \
+  -v usr="$ZBX_USER" -v pass="$ZBX_PASS" <<'SQL'
+CREATE ROLE :"usr" WITH LOGIN PASSWORD :'pass' INHERIT;
+GRANT pg_monitor TO :"usr";
+SQL
+
+podman exec etl-postgres psql -U airflow -d postgres -c "\du $ZBX_USER"   # Member of: {pg_monitor}
+```
+
+Пользователь создаётся вручную в живой базе — при пересоздании тома Postgres
+(чистый передеплой) эту команду нужно выполнить заново, иначе `pgsql.ping` молча
+вернёт `0`.
+
+`CONNECT` на базы по умолчанию есть у `PUBLIC`; проверка, если где-то отзывали:
+
+```bash
+podman exec etl-postgres psql -U airflow -d postgres -Atc \
+  "SELECT datname, has_database_privilege('$ZBX_USER', datname, 'CONNECT') FROM pg_database WHERE NOT datistemplate;"
+```
+
+**2. Плагин агента.**
+
+```bash
+dnf install zabbix-agent2-plugin-postgresql     # версия должна совпадать с zabbix-agent2
+systemctl restart zabbix-agent2
+ps fax | grep -A1 [z]abbix_agent2               # дочерний процесс zabbix-agent2-plugin-postgresql
+```
+
+**3. Проверка.** Порядок параметров у агента 2: `URI, пользователь, пароль, база`
+(не `хост, порт, …` как у шаблона для агента 1 — иначе Postgres увидит
+пользователя с именем `5432`).
+
+```bash
+zabbix_agent2 -t 'pgsql.ping["tcp://127.0.0.1:5432","ПОЛЬЗОВАТЕЛЬ","ПАРОЛЬ","postgres"]'   # [s|1.000000]
+```
+
+**4. Хост в Zabbix.** Шаблон «PostgreSQL by Zabbix agent 2» (не «…by Zabbix agent»),
+макросы на хосте:
+
+| Макрос | Значение |
+|---|---|
+| `{$PG.CONNSTRING.AGENT2}` | `tcp://127.0.0.1:5432` — не `localhost`: порт опубликован только на IPv4, `localhost` может уйти в `::1` |
+| `{$PG.USER}` | пользователь из п.1 |
+| `{$PG.PASSWORD}` | пароль из п.1, тип **Secret text** |
+| `{$PG.DATABASE}` | `postgres` — база для первого подключения; остальные найдёт discovery |
+
+Подключения с хоста к опубликованному порту Postgres видит как внешние —
+срабатывает правило pg_hba с паролем, а не trust, поэтому пароль должен совпадать
+точно. Базы (`airflow`, `openmetadata_db`, `postgres`) обнаруживаются правилом
+«Database discovery» — после привязки шаблона запустите его через «Execute now»,
+иначе ждать до часа.
+
+### Контейнеры Podman — шаблон «Docker by Zabbix agent 2»
+
+**1. API-сокет Podman и доступ для пользователя zabbix.**
+
+```bash
+systemctl enable --now podman.socket
+
+mkdir -p /etc/systemd/system/podman.socket.d
+cat > /etc/systemd/system/podman.socket.d/zabbix.conf <<'EOF2'
+[Socket]
+SocketGroup=zabbix
+SocketMode=0660
+EOF2
+systemctl daemon-reload
+systemctl restart podman.socket
+
+# /run/podman по умолчанию 0700 root — zabbix не дойдёт до сокета внутри.
+# x без r: доступ по точному пути, без листинга. /run чистится при загрузке,
+# поэтому права закрепляются через tmpfiles.d
+echo 'd /run/podman 0711 root root -' > /etc/tmpfiles.d/podman-zabbix.conf
+systemd-tmpfiles --create /etc/tmpfiles.d/podman-zabbix.conf
+
+ls -ld /run/podman                      # drwx--x--x
+ls -l /run/podman/podman.sock           # srw-rw---- root zabbix
+sudo -u zabbix curl -s --unix-socket /run/podman/podman.sock http://d/_ping; echo   # OK
+```
+
+**2. Плагин Docker → сокет Podman.**
+
+```bash
+echo 'Plugins.Docker.Endpoint=unix:///run/podman/podman.sock' > /etc/zabbix/zabbix_agent2.d/plugins.d/docker.conf
+systemctl restart zabbix-agent2
+```
+
+**3. Проверка с сервера Zabbix** (`zabbix_agent2 -t` на хосте идёт от root и
+проблемы с правами не покажет):
+
+```bash
+zabbix_get -s 10.234.1.227 -k docker.ping                    # 1
+zabbix_get -s 10.234.1.227 -k docker.containers.discovery   # JSON со списком etl-*
+```
+
+Если `permission denied`, а `sudo -u zabbix curl …/_ping` отвечает `OK` — это
+SELinux (домен `zabbix_agent_t` → сокет Podman):
+
+```bash
+ausearch -m avc -ts recent | grep zabbix | audit2allow -M zabbix_podman
+semodule -i zabbix_podman.pp
+systemctl restart zabbix-agent2
+```
+
+**4. Хост в Zabbix.** Шаблон «Docker by Zabbix agent 2», затем «Execute now» у
+правил «Containers discovery» и «Images discovery». Метрики «per second» и графики
+дашбордов заполняются за 15–30 минут.
+
+Ожидаемо остаются в «Not supported» ~3 элемента — полей Docker, которых нет в
+совместимом API Podman (Swarm, плагины, blkio при cgroups v2). Их отключить
+(для элементов по контейнерам — через override в правиле обнаружения).
+
+Безопасность: доступ к API-сокету Podman — это полный контроль над контейнерами,
+то есть фактически root. Плагин только читает, но группа `zabbix` получает весь API.
+
+### Если данные не идут
+
+| Симптом | Причина |
+|---|---|
+| `Unknown metric pgsql.ping` | Плагин не загружен: не перезапущен агент, нет `plugins.d/postgresql.conf` или `Include` на него, разные версии агента и плагина |
+| `pgsql.ping` = `0` | Плагин не подключился — смотреть `podman logs etl-postgres --since 15m 2>&1 \| grep FATAL` |
+| `password authentication failed for user "5432"` | Ключ вызывается в формате агента 1 (привязан шаблон «…by Zabbix agent» или ручная проверка в старом формате) |
+| `dial unix /run/podman/podman.sock: permission denied` | Права на `/run/podman` / сокет или SELinux — см. выше |
+| Дашборд «No data», а в Latest data значения есть | Мало истории: нужны два опроса для «per second»; проверить период дашборда |
 
 ---
 
@@ -1825,7 +2059,8 @@ podman exec etl-airflow-worker airflow providers list
 │   ├── airflow-image/
 │   │   └── Dockerfile           ← FROM openmetadata/ingestion, провайдеры
 │   ├── airflow/
-│   │   ├── dags/
+│   │   ├── dags/                    ← DAG'и, которые генерирует OpenMetadata (bundle dags-folder)
+│   │   ├── etl-dags/                ← собственные DAG'и (bundle etl)
 │   │   ├── dag_generated_configs/   ← конфиги пайплайнов, которые деплоит OpenMetadata
 │   │   ├── logs/
 │   │   └── plugins/
@@ -1906,6 +2141,127 @@ systemctl stop openmetadata-server nginx \
     elasticsearch rabbitmq postgres
 
 # После reboot всё запустится автоматически (включая таймер бэкапов)
+```
+
+### Куда класть свои DAG'и
+
+Свои DAG'и — в `/var/storage/containers/airflow/etl-dags` (в контейнерах —
+`/opt/airflow/etl-dags`), **не** в `dags/`. Каталог `dags/` целиком отдан
+OpenMetadata: туда он складывает сгенерированные ingestion-DAG'и с именами-UUID.
+В Airflow это два независимых DAG bundle — `dags-folder` и `etl`
+(`AIRFLOW__DAG_PROCESSOR__DAG_BUNDLE_CONFIG_LIST` в `etl.env`), так что сущности
+не смешиваются ни на диске, ни в интерфейсе (колонка bundle).
+
+```bash
+groupadd etl-dags
+usermod -aG etl-dags <логин>          # для каждого автора DAG'ов
+chown 50000:etl-dags /var/storage/containers/airflow/etl-dags
+chmod 2775 /var/storage/containers/airflow/etl-dags   # setgid: новые файлы наследуют группу
+```
+
+Файлы DAG'ов должны быть читаемы для uid 50000 (под ним работают контейнеры
+Airflow): при обычном `umask` новые файлы получают 644/664 — этого достаточно.
+Файл с `chmod 600` от root Airflow молча не увидит. SELinux-метку файлы наследуют от
+каталога (volume смонтирован с `:z`). Новый DAG подхватывается за 30–60 секунд,
+рестарт не нужен:
+
+```bash
+podman exec etl-airflow-dag-processor airflow dags list-import-errors
+podman exec etl-airflow-dag-processor airflow dags list | grep <имя_dag>
+```
+
+Синтаксис — Airflow 3: `schedule=` (не `schedule_interval=`), `start_date=datetime(...)`
+(функции `days_ago` больше нет), импорт операторов — из
+`airflow.providers.standard.operators.*` или `airflow.sdk`.
+
+### Пользователь для загрузки DAG'ов по SSH/SCP
+
+```bash
+useradd -m -s /bin/bash -G etl-dags dagdev
+passwd dagdev                               # или ключ в ~/.ssh/authorized_keys
+ln -s /var/storage/containers/airflow/etl-dags /home/dagdev/dags
+chown -h dagdev:dagdev /home/dagdev/dags
+
+# Маска 0002 для SFTP-сессий группы: загруженные файлы читаемы для Airflow (uid 50000)
+# и редактируемы коллегами по группе. scp в OpenSSH 9+ работает через SFTP.
+cat > /etc/ssh/sshd_config.d/50-etl-dags.conf <<'EOF'
+Match Group etl-dags
+    ForceCommand internal-sftp -u 0002
+EOF
+sshd -t && systemctl reload sshd
+```
+
+`ForceCommand internal-sftp` оставляет только передачу файлов (scp, sftp, WinSCP),
+без интерактивной оболочки. Если консоль пользователю нужна — не создавайте этот
+файл, а пропишите `umask 0002` в его `~/.bashrc`. При `AllowUsers`/`AllowGroups` в
+`sshd_config` добавьте пользователя туда. Загрузка с Windows:
+`scp .\my_dag.py dagdev@<IP>:dags/` (без `-p`: он перенёс бы локальные права файла,
+и файл с `600` Airflow не прочитает).
+
+### Целевое состояние для внешних DAG'ов и его проверка
+
+| Объект | Должно быть |
+|---|---|
+| Группа `etl-dags` | существует, в ней все авторы DAG'ов |
+| Пользователь `dagdev` | доп. группа `etl-dags`; доступ только SFTP/SCP |
+| uid `50000` | на хосте не заводится — это `airflow` в контейнерах |
+| `/var/storage`, `.../containers`, `.../airflow` | `755` (минимум `o+x`) — путь проходим для `dagdev` |
+| `.../airflow/etl-dags` | `50000:etl-dags`, **`2775`**, SELinux `container_file_t` |
+| файлы внутри `etl-dags` | `dagdev:etl-dags`, **`664`** (маска SFTP `0002`) |
+| `.../airflow/dags` | `50000:0`, `755` — только OpenMetadata, `dagdev` не пишет |
+| `.../airflow/dags/etl` | не существует |
+| `/home/dagdev/dags` | симлинк → `/var/storage/containers/airflow/etl-dags` |
+| `/home/dagdev/.ssh` / `authorized_keys` | `700` / `600`, владелец `dagdev`, SELinux `ssh_home_t` |
+| `/etc/ssh/sshd_config.d/50-etl-dags.conf` | `Match Group etl-dags` → `ForceCommand internal-sftp -u 0002` |
+| `etl.env` | `DAG_BUNDLE_CONFIG_LIST` с bundle `dags-folder` и `etl` |
+| все `airflow-*.container` | `Volume=...etl-dags:/opt/airflow/etl-dags:z` |
+
+Скрипт проверки (только читает, печатает `OK`/`FAIL` по каждому пункту):
+
+```bash
+cat > /usr/local/sbin/check-etl-dags.sh <<'EOF'
+#!/bin/bash
+D=/var/storage/containers/airflow/etl-dags
+U=dagdev
+ok(){ echo "OK    $*"; }; bad(){ echo "FAIL  $*"; }
+
+getent group etl-dags >/dev/null            && ok "группа etl-dags"            || bad "группы etl-dags нет"
+id "$U" >/dev/null 2>&1                     && ok "пользователь $U"            || bad "пользователя $U нет"
+id -nG "$U" 2>/dev/null | grep -qw etl-dags && ok "$U в группе etl-dags"       || bad "$U не в группе etl-dags"
+
+st=$(stat -c '%u:%G %a' "$D" 2>/dev/null)
+[ "$st" = "50000:etl-dags 2775" ]           && ok "$D = $st"                   || bad "$D = '$st' (нужно 50000:etl-dags 2775)"
+ls -Zd "$D" 2>/dev/null | grep -q container_file_t && ok "SELinux container_file_t" || bad "SELinux: $(ls -Zd "$D" 2>/dev/null | awk '{print $1}')"
+runuser -u "$U" -- test -w "$D"             && ok "$U может писать в $D"       || bad "$U не может писать в $D (права на путь?)"
+runuser -u "$U" -- test -w /var/storage/containers/airflow/dags \
+                                            && bad "$U может писать в dags/ (не должен)" || ok "$U не пишет в dags/"
+n=$(find "$D" -type f ! -perm -o=r 2>/dev/null | wc -l)
+[ "$n" -eq 0 ]                              && ok "все файлы читаемы для Airflow" || bad "$n файл(ов) нечитаемы для uid 50000: $(find "$D" -type f ! -perm -o=r | head -3 | tr '\n' ' ')"
+[ ! -e /var/storage/containers/airflow/dags/etl ] && ok "старого dags/etl нет" || bad "остался /var/storage/containers/airflow/dags/etl"
+
+[ "$(readlink /home/$U/dags)" = "$D" ]      && ok "симлинк ~$U/dags"           || bad "симлинк ~$U/dags -> '$(readlink /home/$U/dags)'"
+if [ -f /home/$U/.ssh/authorized_keys ]; then
+  [ "$(stat -c '%U %a' /home/$U/.ssh)" = "$U 700" ] && ok ".ssh 700" || bad ".ssh: $(stat -c '%U %a' /home/$U/.ssh)"
+  [ "$(stat -c '%U %a' /home/$U/.ssh/authorized_keys)" = "$U 600" ] && ok "authorized_keys 600" || bad "authorized_keys: $(stat -c '%U %a' /home/$U/.ssh/authorized_keys)"
+  ls -Z /home/$U/.ssh/authorized_keys | grep -q ssh_home_t && ok "authorized_keys ssh_home_t" || bad "authorized_keys без ssh_home_t (restorecon -Rv /home/$U/.ssh)"
+else
+  echo "INFO  ключа нет — вход только по паролю"
+fi
+
+fc=$(sshd -T -C user=$U,host=localhost,addr=127.0.0.1 2>/dev/null | grep -i '^forcecommand')
+echo "$fc" | grep -q 'internal-sftp -u 0002' && ok "sshd: $fc" || bad "sshd: ForceCommand для $U не задан ('$fc')"
+
+grep -q '"name":"etl"' /var/storage/containers/etl.env && ok "bundle etl в etl.env" || bad "bundle etl не задан в etl.env"
+units=(/etc/containers/systemd/airflow-*.container)
+[ -e "${units[0]}" ] || bad "юниты airflow-*.container не найдены"
+for f in "${units[@]}"; do
+  [ -e "$f" ] && { grep -q 'etl-dags:/opt/airflow/etl-dags' "$f" && ok "volume etl-dags в $(basename "$f")" || bad "нет volume etl-dags в $(basename "$f")"; }
+done
+podman exec etl-airflow-dag-processor test -r /opt/airflow/etl-dags 2>/dev/null \
+                                            && ok "каталог виден в контейнере dag-processor" || bad "dag-processor не видит /opt/airflow/etl-dags"
+EOF
+chmod 700 /usr/local/sbin/check-etl-dags.sh
+/usr/local/sbin/check-etl-dags.sh
 ```
 
 ### Если пароли Postgres/RabbitMQ разошлись с `secrets.env`
